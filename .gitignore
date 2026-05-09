@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+.github/
 # C extensions
 *.so
 
@@ -50,6 +51,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+coverage/
 
 # Translations
 *.mo
@@ -149,13 +151,20 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
+.venv/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Local databases
+*.sqlite3
+*.db
 
 # Spyder project settings
 .spyderproject
@@ -216,3 +225,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node / Vite
+node_modules/
+frontend/dist/
+.vite/
+
+# macOS
+.DS_Store

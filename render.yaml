@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: my-financing-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_NAME
+        value: My Financing API
+      - key: DATABASE_URL
+        value: sqlite:///./finance.sqlite3
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: LLM_API_BASE
+        value: https://api.openai.com/v1
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+
