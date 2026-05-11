@@ -7,9 +7,11 @@ import {
   createDcaPlan,
   createTransaction,
   deleteDcaPlan,
+  updateDcaPlan,
   deleteTransaction,
   deleteTransactionsBatch,
   getFundNav,
+  getFundPerformance,
   getLatestAdvice,
   getPortfolioSummary,
   getSnapshots,
@@ -25,21 +27,19 @@ import "./styles.css";
 
 const emptySummary = {
   market_value: "0",
-  confirmed_market_value: "0",
   total_invested: "0",
   realized_cash: "0",
   profit: "0",
   profit_rate: "0",
   holding_profit: "0",
   cumulative_profit: "0",
-  confirmed_holding_profit: "0",
-  confirmed_cumulative_profit: "0",
   holdings: [],
 };
 
 function App() {
   const [summary, setSummary] = useState(emptySummary);
   const [snapshots, setSnapshots] = useState([]);
+  const [snapshotPeriod, setSnapshotPeriod] = useState("month");
   const [recentTransactions, setRecentTransactions] = useState([]);
   const [dcaPlans, setDcaPlans] = useState([]);
   const [dcaExecutions, setDcaExecutions] = useState([]);
@@ -56,7 +56,7 @@ function App() {
     try {
       const [summaryData, snapshotData, transactionData, dcaPlanData, dcaExecutionData, adviceData] = await Promise.all([
         getPortfolioSummary(),
-        getSnapshots(),
+        getSnapshots(snapshotPeriod),
         listTransactions({ limit: 5 }),
         listDcaPlans(),
         listDcaExecutions(),
@@ -79,18 +79,23 @@ function App() {
     loadData();
   }, []);
 
+  useEffect(() => {
+    getSnapshots(snapshotPeriod).then(setSnapshots).catch(() => {});
+  }, [snapshotPeriod]);
+
   async function updateNavs() {
-    const adminToken = localStorage.getItem("my-financing-admin-token") || window.prompt("请输入后端 ADMIN_TOKEN");
+    const adminToken = window.prompt("请输入后端 ADMIN_TOKEN", localStorage.getItem("my-financing-admin-token") || "");
     if (!adminToken) return;
-    localStorage.setItem("my-financing-admin-token", adminToken);
     setUpdatingNav(true);
     setError("");
     setUpdateResult(null);
     try {
       const result = await runDailyUpdate(adminToken);
+      localStorage.setItem("my-financing-admin-token", adminToken);
       setUpdateResult(result);
       await loadData();
     } catch (err) {
+      localStorage.removeItem("my-financing-admin-token");
       setError(err.message);
     } finally {
       setUpdatingNav(false);
@@ -135,22 +140,23 @@ function App() {
         <Metric icon={<CircleDollarSign />} label="最新市值" value={money(summary.market_value)} hint={summary.latest_nav_date ? `截至 ${summary.latest_nav_date}` : ""} />
         <Metric icon={<TrendingUp />} label="最新持有收益" value={money(summary.holding_profit ?? summary.profit)} tone={Number(summary.holding_profit ?? summary.profit) >= 0 ? "gain" : "loss"} />
         <Metric icon={<Activity />} label="最新累计收益" value={money(summary.cumulative_profit ?? summary.profit)} tone={Number(summary.cumulative_profit ?? summary.profit) >= 0 ? "gain" : "loss"} />
-        <Metric icon={<CircleDollarSign />} label="确认市值" value={money(summary.confirmed_market_value ?? summary.market_value)} hint={summary.confirmed_nav_cutoff_date ? `截至 ${summary.confirmed_nav_cutoff_date}` : ""} />
-        <Metric icon={<TrendingUp />} label="确认持有收益" value={money(summary.confirmed_holding_profit ?? summary.holding_profit ?? summary.profit)} tone={Number(summary.confirmed_holding_profit ?? summary.holding_profit ?? summary.profit) >= 0 ? "gain" : "loss"} />
-        <Metric icon={<Activity />} label="确认累计收益" value={money(summary.confirmed_cumulative_profit ?? summary.cumulative_profit ?? summary.profit)} tone={Number(summary.confirmed_cumulative_profit ?? summary.cumulative_profit ?? summary.profit) >= 0 ? "gain" : "loss"} />
         <Metric icon={<BarChart3 />} label="持仓成本" value={money(summary.total_invested)} />
+      </section>
+
+      <section style={{marginBottom: "16px"}}>
+        <FundPerformancePanel holdings={summary.holdings} />
       </section>
 
       <section className="dashboard-grid">
         <Panel title="资产走势">
-          <PortfolioChart snapshots={snapshots} />
+          <PortfolioChart snapshots={snapshots} period={snapshotPeriod} onPeriodChange={setSnapshotPeriod} />
         </Panel>
         <Panel title="持仓分布">
           <HoldingChart holdings={summary.holdings} />
         </Panel>
       </section>
 
-      <section className="content-grid">
+      <section className="content-grid equal-height">
         <Panel title="持仓明细">
           <HoldingsTable holdings={summary.holdings} />
         </Panel>
@@ -159,26 +165,29 @@ function App() {
         </Panel>
       </section>
 
-      <section className="content-grid">
+      <section className="content-grid" style={{marginTop: "16px"}}>
+        <Panel title="定投计划">
+          <div className="scroll-panel"><DcaPlanList plans={dcaPlans} loading={loading} onChanged={loadData} /></div>
+        </Panel>
+        <Panel title="定投执行">
+          <div className="scroll-panel"><DcaExecutionList executions={dcaExecutions} loading={loading} /></div>
+        </Panel>
+      </section>
+
+      <section style={{marginTop: "16px"}}>
         <Panel
           title={
             <span className="panel-title-row">
               最近交易
-              <button className="ghost-button compact" type="button" onClick={() => setPage("history")}>查看历史</button>
+              <button className="ghost-button compact" type="button" onClick={() => setPage("history")}>查看全部</button>
             </span>
           }
         >
           <RecentTransactionList transactions={recentTransactions} loading={loading} onOpenHistory={() => setPage("history")} />
         </Panel>
-        <Panel title="定投计划">
-          <DcaPlanList plans={dcaPlans} loading={loading} onChanged={loadData} />
-        </Panel>
       </section>
 
-      <section className="content-grid">
-        <Panel title="定投执行">
-          <DcaExecutionList executions={dcaExecutions} loading={loading} />
-        </Panel>
+      <section style={{marginTop: "16px"}}>
         <Panel title="AI 实时对话">
           <ChatPanel advice={advice} />
         </Panel>
@@ -302,16 +311,23 @@ function HistoryPage({ onBack, onChanged }) {
 }
 
 function AlipayImportPanel({ onImported }) {
-  const [path, setPath] = useState("/Users/chen/Desktop/github_pro/My_Financing/陈育堃_20260509170326560_2088522851741678.pdf");
+  const [file, setFile] = useState(null);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  function handleFileChange(event) {
+    setFile(event.target.files[0] || null);
+    setResult(null);
+    setError("");
+  }
+
   async function runImport(dryRun) {
+    if (!file) return;
     setBusy(true);
     setError("");
     try {
-      const data = await importAlipayPdf(path, dryRun);
+      const data = await importAlipayPdf(file, dryRun);
       setResult(data);
       if (!dryRun) {
         await onImported();
@@ -326,14 +342,14 @@ function AlipayImportPanel({ onImported }) {
   return (
     <div className="import-panel">
       <label>
-        支付宝 PDF 路径
-        <input value={path} onChange={(event) => setPath(event.target.value)} />
+        支付宝 PDF 文件
+        <input type="file" accept=".pdf" onChange={handleFileChange} />
       </label>
       <div className="import-actions">
-        <button className="secondary-button" type="button" disabled={busy || !path} onClick={() => runImport(true)}>
+        <button className="secondary-button" type="button" disabled={busy || !file} onClick={() => runImport(true)}>
           解析预览
         </button>
-        <button className="primary-button inline-primary" type="button" disabled={busy || !path} onClick={() => runImport(false)}>
+        <button className="primary-button inline-primary" type="button" disabled={busy || !file} onClick={() => runImport(false)}>
           确认导入
         </button>
       </div>
@@ -347,21 +363,33 @@ function AlipayImportPanel({ onImported }) {
   );
 }
 
-function PortfolioChart({ snapshots }) {
+const PERIOD_OPTIONS = [
+  { value: "week", label: "近一周" },
+  { value: "month", label: "近一月" },
+  { value: "3months", label: "近三月" },
+  { value: "6months", label: "近半年" },
+  { value: "year", label: "近一年" },
+  { value: "all", label: "全部" },
+];
+
+function PortfolioChart({ snapshots, period, onPeriodChange }) {
   const ref = useChart((chart) => {
     const data = snapshots.length
       ? snapshots
       : [{ date: "暂无快照", market_value: 0, total_invested: 0, profit: 0 }];
     chart.setOption({
-      grid: { left: 42, right: 20, top: 26, bottom: 36 },
+      grid: { left: 42, right: 60, top: 26, bottom: 36 },
       tooltip: { trigger: "axis" },
       xAxis: { type: "category", data: data.map((item) => item.date) },
-      yAxis: { type: "value" },
+      yAxis: [
+        { type: "value", name: "金额", nameTextStyle: { fontSize: 11 } },
+        { type: "value", name: "收益", nameTextStyle: { fontSize: 11 } },
+      ],
       series: [
         {
           name: "市值",
           type: "line",
-          smooth: true,
+          smooth: false,
           data: data.map((item) => Number(item.market_value)),
           areaStyle: { opacity: 0.08 },
           color: "#2563eb",
@@ -369,14 +397,37 @@ function PortfolioChart({ snapshots }) {
         {
           name: "投入",
           type: "line",
-          smooth: true,
+          smooth: false,
           data: data.map((item) => Number(item.total_invested)),
           color: "#10b981",
+        },
+        {
+          name: "累计收益",
+          type: "line",
+          yAxisIndex: 1,
+          smooth: false,
+          data: data.map((item) => Number(item.cumulative_profit ?? item.profit)),
+          color: "#f59e0b",
         },
       ],
     });
   }, [snapshots]);
-  return <div className="chart" ref={ref} />;
+  return (
+    <div>
+      <div className="period-selector">
+        {PERIOD_OPTIONS.map((opt) => (
+          <button
+            key={opt.value}
+            className={`period-btn ${period === opt.value ? "active" : ""}`}
+            onClick={() => onPeriodChange(opt.value)}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+      <div className="chart" ref={ref} />
+    </div>
+  );
 }
 
 function HoldingChart({ holdings }) {
@@ -402,6 +453,232 @@ function HoldingChart({ holdings }) {
   return <div className="chart" ref={ref} />;
 }
 
+function FundPerformancePanel({ holdings }) {
+  const [fundCode, setFundCode] = useState("");
+  const [range, setRange] = useState("month");
+  const [chartData, setChartData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const ranges = [
+    { key: "week", label: "近一周" },
+    { key: "month", label: "近一月" },
+    { key: "3month", label: "近三月" },
+    { key: "6month", label: "近半年" },
+    { key: "year", label: "近一年" },
+  ];
+
+  useEffect(() => {
+    if (!fundCode) {
+      setChartData(null);
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      setLoading(true);
+      setError("");
+      try {
+        const data = await getFundPerformance(fundCode, range);
+        if (!cancelled) setChartData(data);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+  }, [fundCode, range]);
+
+  const chartRef = useChart((chart) => {
+    if (!chartData || !chartData.length) {
+      chart.setOption({
+        title: { text: fundCode ? "暂无数据" : "请选择基金", left: "center", top: "center", textStyle: { color: "#94a3b8", fontSize: 14 } },
+      });
+      return;
+    }
+    const dates = chartData.map((d) => d.nav_date);
+    const navs = chartData.map((d) => Number(d.unit_nav));
+    const cumulativeReturns = chartData.map((d) => d.cumulative_return != null ? Number(d.cumulative_return) * 100 : 0);
+    const growthRates = chartData.map((d) => d.daily_growth_rate != null ? Number(d.daily_growth_rate) * 100 : null);
+    // Fund index: normalized to 100 at the first NAV in range
+    const baseNav = navs[0];
+    const fundIndex = navs.map((n) => baseNav !== 0 ? (n / baseNav) * 100 : 100);
+    const minIdx = Math.min(...fundIndex);
+    const maxIdx = Math.max(...fundIndex);
+    const idxPadding = Math.max((maxIdx - minIdx) * 0.15, 2);
+
+    chart.setOption({
+      grid: { left: 16, right: 56, top: 24, bottom: 40 },
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "#ffffff",
+        borderColor: "#e8ecf2",
+        borderWidth: 1,
+        textStyle: { color: "#1a1a2e", fontSize: 13 },
+        formatter: function (params) {
+          const date = params[0].axisValue;
+          let tip = `<div style="font-size:12px;color:#94a3b8;margin-bottom:4px">${date}</div>`;
+          params.forEach(function (p) {
+            if (p.value == null) return;
+            if (p.seriesName === "基金指数") {
+              tip += `<div style="font-size:13px">${p.marker} ${p.seriesName} <b style="margin-left:8px">${Number(p.value).toFixed(2)}</b></div>`;
+            }
+            if (p.seriesName === "累计收益") {
+              const v = Number(p.value);
+              const color = v >= 0 ? "#dc2626" : "#059669";
+              const sign = v >= 0 ? "+" : "";
+              tip += `<div style="font-size:13px;color:${color}">${p.marker} ${p.seriesName} <b style="margin-left:8px">${sign}${v.toFixed(2)}%</b></div>`;
+            }
+          });
+          if (params[0].dataIndex > 0 && growthRates[params[0].dataIndex] != null) {
+            const g = growthRates[params[0].dataIndex];
+            const d = fundIndex[params[0].dataIndex] - fundIndex[params[0].dataIndex - 1];
+            const color = g >= 0 ? "#dc2626" : "#059669";
+            const sign = g >= 0 ? "+" : "";
+            tip += `<div style="font-size:11px;color:${color};margin-top:2px">日涨跌 ${sign}${d.toFixed(2)} (${sign}${g.toFixed(2)}%)</div>`;
+          }
+          return tip;
+        },
+      },
+      xAxis: {
+        type: "category",
+        data: dates,
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: "#e8ecf2" } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: "#94a3b8",
+          fontSize: 11,
+          rotate: dates.length > 60 ? 45 : 0,
+          formatter: function (v) {
+            if (dates.length > 60) return v.slice(5);
+            if (dates.length > 30) return v.slice(5).replace("-", "/");
+            return v;
+          },
+        },
+      },
+      yAxis: [
+        {
+          type: "value",
+          min: minIdx - idxPadding,
+          max: maxIdx + idxPadding,
+          splitNumber: 4,
+          axisLabel: { color: "#2563eb", fontSize: 11, formatter: function (v) { return v.toFixed(1); } },
+          splitLine: { lineStyle: { color: "#f1f5f9", type: "dashed" } },
+        },
+        {
+          type: "value",
+          splitNumber: 4,
+          axisLabel: { color: "#f97316", fontSize: 11, formatter: "{value}%" },
+          splitLine: { show: false },
+        },
+      ],
+      series: [
+        {
+          name: "基金指数",
+          type: "line",
+          yAxisIndex: 0,
+          data: fundIndex,
+          smooth: false,
+          symbol: "none",
+          lineStyle: { color: "#2563eb", width: 2 },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: "rgba(37,99,235,0.15)" },
+              { offset: 1, color: "rgba(37,99,235,0.01)" },
+            ]),
+          },
+        },
+        {
+          name: "累计收益",
+          type: "line",
+          yAxisIndex: 1,
+          data: cumulativeReturns,
+          smooth: false,
+          symbol: "none",
+          lineStyle: { color: "#f97316", width: 2 },
+        },
+      ],
+    });
+  }, [chartData]);
+
+  const fundOptions = holdings.map((h) => ({
+    code: h.fund_code,
+    name: h.fund_name,
+  }));
+
+  return (
+    <Panel
+      title={
+        <span className="panel-title-row">
+          业绩走势
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <select
+              value={fundCode}
+              onChange={(e) => setFundCode(e.target.value)}
+              style={{ minHeight: 32, width: 180, fontSize: 13, padding: "0 6px" }}
+            >
+              <option value="">选择基金</option>
+              {fundOptions.map((f) => (
+                <option key={f.code} value={f.code}>{f.name}</option>
+              ))}
+            </select>
+            <div className="range-toggle">
+              {ranges.map((r) => (
+                <button
+                  key={r.key}
+                  className={range === r.key ? "active" : ""}
+                  type="button"
+                  onClick={() => setRange(r.key)}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </span>
+      }
+    >
+      {error && <p className="chat-error">{error}</p>}
+      {loading && <EmptyState text="正在加载..." />}
+      {fundCode ? (
+        <>
+          <div className="chart chart-tall" ref={chartRef} />
+          {chartData && chartData.length > 1 && (
+            <div className="perf-stats">
+              {_renderStat("区间收益", formatPerfReturn(chartData))}
+              {_renderStat("最新净值", Number(chartData[chartData.length - 1].unit_nav).toFixed(4))}
+              {_renderStat("最高净值", Math.max(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
+              {_renderStat("最低净值", Math.min(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
+            </div>
+          )}
+        </>
+      ) : (
+        <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 13, padding: "10px 0 30px" }}>请选择基金查看业绩走势</div>
+      )}
+    </Panel>
+  );
+}
+
+function _renderStat(label, value) {
+  const isReturn = label === "区间收益";
+  const num = Number(value);
+  return (
+    <div className="perf-stat" key={label}>
+      <span>{label}</span>
+      <strong className={isReturn ? (num >= 0 ? "gain" : "loss") : ""}>{value}{isReturn ? "%" : ""}</strong>
+    </div>
+  );
+}
+
+function formatPerfReturn(data) {
+  if (!data || data.length < 2) return "0.00";
+  // Use the last cumulative_return from the endpoint (already cost-basis aware)
+  const last = data[data.length - 1];
+  if (last.cumulative_return != null) return (Number(last.cumulative_return) * 100).toFixed(2);
+  return "0.00";
+}
+
 function HoldingsTable({ holdings }) {
   if (!holdings.length) return <EmptyState text="录入第一笔交易后，这里会显示持仓、成本和收益。" />;
   return (
@@ -413,6 +690,7 @@ function HoldingsTable({ holdings }) {
             <th>份额</th>
             <th>净值</th>
             <th>市值</th>
+            <th>当日盈亏</th>
             <th>持有收益</th>
             <th>累计收益</th>
             <th>持有收益率</th>
@@ -426,31 +704,22 @@ function HoldingsTable({ holdings }) {
                 <span>{item.fund_code}</span>
               </td>
               <td>{number(item.shares)}</td>
-              <td className="dual-cell">
-                <strong>{item.latest_nav || "-"}</strong>
-                <span>确认 {item.confirmed_nav || "-"} · {item.confirmed_nav_date || "-"}</span>
-              </td>
-              <td className="dual-cell">
+              <td><strong>{item.latest_nav || "-"}</strong></td>
+              <td class="market-value-cell">
                 <strong>{money(item.market_value)}</strong>
-                <span>确认 {money(item.confirmed_market_value ?? item.market_value)}</span>
+                <small>未确认 {money(Number(item.market_value) - Number(item.confirmed_market_value || 0))}</small>
+              </td>
+              <td className={Number(item.daily_pnl ?? 0) >= 0 ? "gain" : "loss"}>
+                <strong>{item.daily_pnl != null ? money(item.daily_pnl) : "-"}</strong>
               </td>
               <td className={Number(item.holding_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
                 <strong>{money(item.holding_profit ?? item.profit)}</strong>
-                <span className={Number(item.confirmed_holding_profit ?? item.holding_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
-                  确认 {money(item.confirmed_holding_profit ?? item.holding_profit ?? item.profit)}
-                </span>
               </td>
               <td className={Number(item.cumulative_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
                 <strong>{money(item.cumulative_profit ?? item.profit)}</strong>
-                <span className={Number(item.confirmed_cumulative_profit ?? item.cumulative_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
-                  确认 {money(item.confirmed_cumulative_profit ?? item.cumulative_profit ?? item.profit)}
-                </span>
               </td>
               <td className={Number(item.holding_profit_rate ?? item.profit_rate) >= 0 ? "gain" : "loss"}>
                 <strong>{percent(item.holding_profit_rate ?? item.profit_rate)}</strong>
-                <span className={Number(item.confirmed_holding_profit_rate ?? item.holding_profit_rate ?? item.profit_rate) >= 0 ? "gain" : "loss"}>
-                  确认 {percent(item.confirmed_holding_profit_rate ?? item.holding_profit_rate ?? item.profit_rate)}
-                </span>
               </td>
             </tr>
           ))}
@@ -472,6 +741,7 @@ function TransactionForm({ onCreated }) {
     fee: "",
     dca_end_date: "",
     frequency: "monthly",
+    frequency_day: "",
     note: "",
   });
   const [saving, setSaving] = useState(false);
@@ -527,16 +797,18 @@ function TransactionForm({ onCreated }) {
           start_date: form.trade_date,
           end_date: form.dca_end_date || null,
           frequency: form.frequency,
+          day_of_month: form.frequency_day ? Number(form.frequency_day) : null,
         });
       } else {
         await createTransaction({
           ...form,
           fund_code: fundCode,
+          trade_date: undefined,
           amount: calculated.amount || "0",
           shares: calculated.shares || "0",
           nav: form.nav || null,
           fee: form.fee || "0",
-          initiated_at: form.initiated_time ? `${form.trade_date}T${form.initiated_time}` : null,
+          initiated_at: `${form.trade_date}T${form.initiated_time || "00:00:00"}`,
         });
       }
       setForm((current) => ({ ...current, amount: "", shares: "", nav: "", fee: "", dca_end_date: "", initiated_time: "", note: "" }));
@@ -576,13 +848,13 @@ function TransactionForm({ onCreated }) {
       </div>
       <div className="field-row">
         <label>
-          {form.transaction_type === "dca" ? "起始日期" : "日期"}
+          {form.transaction_type === "dca" ? "起始日期" : "发起日期"}
           <input type="date" value={form.trade_date} onChange={(event) => update("trade_date", event.target.value)} required />
         </label>
         {form.transaction_type !== "dca" && (
           <label>
-            时间
-            <input type="time" step="1" value={form.initiated_time} onChange={(event) => update("initiated_time", event.target.value)} placeholder="留空为当前时间" />
+            发起时间
+            <input type="time" step="1" value={form.initiated_time} onChange={(event) => update("initiated_time", event.target.value)} placeholder="留空为 00:00" />
           </label>
         )}
         <label>
@@ -600,12 +872,38 @@ function TransactionForm({ onCreated }) {
         <div className="field-row">
           <label>
             频率
-            <select value={form.frequency} onChange={(event) => update("frequency", event.target.value)}>
+            <select value={form.frequency} onChange={(event) => { update("frequency", event.target.value); update("frequency_day", ""); }}>
               <option value="daily">每日</option>
               <option value="weekly">每周</option>
               <option value="monthly">每月</option>
             </select>
           </label>
+          {form.frequency === "weekly" && (
+            <label>
+              星期
+              <select value={form.frequency_day} onChange={(event) => update("frequency_day", event.target.value)}>
+                <option value="">自动</option>
+                <option value="1">周一</option>
+                <option value="2">周二</option>
+                <option value="3">周三</option>
+                <option value="4">周四</option>
+                <option value="5">周五</option>
+                <option value="6">周六</option>
+                <option value="7">周日</option>
+              </select>
+            </label>
+          )}
+          {form.frequency === "monthly" && (
+            <label>
+              扣款日
+              <select value={form.frequency_day} onChange={(event) => update("frequency_day", event.target.value)}>
+                <option value="">自动</option>
+                {Array.from({length: 28}, (_, i) => i + 1).map((d) => (
+                  <option key={d} value={d}>{d}日</option>
+                ))}
+              </select>
+            </label>
+          )}
           <label>
             截止日期
             <input type="date" value={form.dca_end_date} onChange={(event) => update("dca_end_date", event.target.value)} />
@@ -683,7 +981,10 @@ function RecentTransactionList({ transactions, loading, onOpenHistory }) {
           <div className="transaction-item" key={item.id}>
             <div className="fund-cell">
               <strong>{item.fund_name || item.fund_code}</strong>
-              <span>{item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}</span>
+              <span>
+                {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
+                {item.status === "pending" && <span className="pending-badge">待确认</span>}
+              </span>
               {(item.initiated_at || item.confirmed_at) && (
                 <span style={{fontSize: "0.8em", color: "#888"}}>发起 {timeStr(item.initiated_at)} · 确认 {timeStr(item.confirmed_at)}</span>
               )}
@@ -857,7 +1158,10 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
             <div className="transaction-item" key={item.id}>
               <div className="fund-cell">
                 <strong>{item.fund_name || item.fund_code}</strong>
-                <span>{item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}</span>
+                <span>
+                  {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
+                  {item.status === "pending" && <span className="pending-badge">待确认</span>}
+                </span>
                 <span>份额 {number(item.shares)} · 净值 {item.nav || "-"} · 手续费 {money(item.fee)}</span>
                 {(item.initiated_at || item.confirmed_at) && (
                   <span style={{fontSize: "0.8em", color: "#888"}}>发起 {timeStr(item.initiated_at)} · 确认 {timeStr(item.confirmed_at)}</span>
@@ -909,6 +1213,9 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
 
 function DcaPlanList({ plans, loading, onChanged }) {
   const [deletingId, setDeletingId] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
 
   async function removePlan(planId) {
     if (!window.confirm("确认删除该定投计划？关联的执行记录将被清除，已生成的交易不受影响。")) return;
@@ -923,30 +1230,136 @@ function DcaPlanList({ plans, loading, onChanged }) {
     }
   }
 
+  function startEdit(plan) {
+    setEditingId(plan.id);
+    setEditForm({
+      amount: plan.amount,
+      fee: plan.fee || "0",
+      frequency: plan.frequency,
+      day_of_month: plan.day_of_month || "",
+      end_date: plan.end_date || "",
+      status: plan.status,
+    });
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditForm({});
+  }
+
+  function updateEditForm(key, value) {
+    setEditForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function saveEdit(planId) {
+    setSaving(true);
+    try {
+      const payload = {};
+      if (editForm.amount !== undefined) payload.amount = editForm.amount;
+      if (editForm.fee !== undefined) payload.fee = editForm.fee || "0";
+      if (editForm.frequency) payload.frequency = editForm.frequency;
+      if (editForm.day_of_month !== undefined) payload.day_of_month = editForm.day_of_month ? Number(editForm.day_of_month) : null;
+      if (editForm.end_date !== undefined) payload.end_date = editForm.end_date || null;
+      if (editForm.status) payload.status = editForm.status;
+      await updateDcaPlan(planId, payload);
+      setEditingId(null);
+      setEditForm({});
+      if (onChanged) onChanged();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   if (loading) return <EmptyState text="正在读取定投计划。" />;
   if (!plans.length) return <EmptyState text="暂无定投计划。" />;
   return (
     <div className="transaction-list">
       {plans.slice(0, 8).map((item) => (
         <div className="transaction-item" key={item.id}>
-          <div>
-            <strong>{item.fund_code}</strong>
-            <span>
-              {frequencyName(item.frequency)} · {item.start_date}
-              {item.end_date ? ` 至 ${item.end_date}` : " 起长期"}
-              {Number(item.fee) > 0 ? ` · 手续费 ${money(item.fee)}` : ""}
-            </span>
-          </div>
-          <div style={{display: "flex", alignItems: "center", gap: "8px"}}>
-            <b>{money(item.amount)}</b>
-            <button
-              className="danger-button"
-              type="button"
-              disabled={deletingId === item.id}
-              onClick={() => removePlan(item.id)}
-              style={{fontSize: "0.75em", padding: "2px 6px"}}
-            >删除</button>
-          </div>
+          {editingId === item.id ? (
+            <div className="dca-edit-form">
+              <div className="dca-edit-row">
+                <label>金额<input type="number" step="0.01" value={editForm.amount} onChange={(e) => updateEditForm("amount", e.target.value)} /></label>
+                <label>手续费<input type="number" step="0.01" value={editForm.fee} onChange={(e) => updateEditForm("fee", e.target.value)} /></label>
+              </div>
+              <div className="dca-edit-row">
+                <label>周期
+                  <select value={editForm.frequency} onChange={(e) => { updateEditForm("frequency", e.target.value); updateEditForm("day_of_month", ""); }}>
+                    <option value="daily">每日</option>
+                    <option value="weekly">每周</option>
+                    <option value="monthly">每月</option>
+                  </select>
+                </label>
+                {editForm.frequency === "weekly" && (
+                  <label>星期
+                    <select value={editForm.day_of_month} onChange={(e) => updateEditForm("day_of_month", e.target.value)}>
+                      <option value="">自动</option>
+                      <option value="1">周一</option>
+                      <option value="2">周二</option>
+                      <option value="3">周三</option>
+                      <option value="4">周四</option>
+                      <option value="5">周五</option>
+                      <option value="6">周六</option>
+                      <option value="7">周日</option>
+                    </select>
+                  </label>
+                )}
+                {editForm.frequency === "monthly" && (
+                  <label>扣款日
+                    <select value={editForm.day_of_month} onChange={(e) => updateEditForm("day_of_month", e.target.value)}>
+                      <option value="">自动</option>
+                      {Array.from({length: 28}, (_, i) => i + 1).map((d) => (
+                        <option key={d} value={d}>{d}日</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {editForm.frequency === "daily" && <label></label>}
+              </div>
+              <div className="dca-edit-row">
+                <label>截止日期<input type="date" value={editForm.end_date} onChange={(e) => updateEditForm("end_date", e.target.value)} /></label>
+                <label>状态
+                  <select value={editForm.status} onChange={(e) => updateEditForm("status", e.target.value)}>
+                    <option value="active">进行中</option>
+                    <option value="paused">已暂停</option>
+                  </select>
+                </label>
+              </div>
+              <div className="dca-edit-actions">
+                <button className="secondary-button compact" type="button" disabled={saving} onClick={() => saveEdit(item.id)}>{saving ? "保存中" : "保存"}</button>
+                <button className="ghost-button compact" type="button" onClick={cancelEdit}>取消</button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="fund-cell">
+                <strong>{item.fund_name || item.fund_code}</strong>
+                <span>
+                  {item.fund_code}
+                  {" · "}{frequencyName(item.frequency)}
+                  {item.frequency === "weekly" && item.day_of_month ? `(${weekdayName(item.day_of_month)})` : ""}
+                  {item.frequency === "monthly" && item.day_of_month ? `(${item.day_of_month}日)` : ""}
+                  {" · "}{item.start_date}
+                  {item.end_date ? ` 至 ${item.end_date}` : " 起长期"}
+                  {Number(item.fee) > 0 ? ` · 手续费 ${money(item.fee)}` : ""}
+                  {item.status === "paused" ? " · 已暂停" : ""}
+                </span>
+              </div>
+              <div style={{display: "flex", alignItems: "center", gap: "8px"}}>
+                <b>{money(item.amount)}</b>
+                <button className="ghost-button compact" type="button" onClick={() => startEdit(item)} style={{fontSize: "0.75em", padding: "2px 6px"}}>编辑</button>
+                <button
+                  className="danger-button"
+                  type="button"
+                  disabled={deletingId === item.id}
+                  onClick={() => removePlan(item.id)}
+                  style={{fontSize: "0.75em", padding: "2px 6px"}}
+                >删除</button>
+              </div>
+            </>
+          )}
         </div>
       ))}
     </div>
@@ -1019,13 +1432,6 @@ function ChatPanel({ advice }) {
     }
   }, [advice, messages.length]);
 
-  useEffect(() => {
-    if (adminToken) {
-      localStorage.setItem("my-financing-admin-token", adminToken);
-    } else {
-      localStorage.removeItem("my-financing-admin-token");
-    }
-  }, [adminToken]);
 
   async function submit(event) {
     event.preventDefault();
@@ -1046,7 +1452,9 @@ function ChatPanel({ advice }) {
           return updated;
         });
       });
+      localStorage.setItem("my-financing-admin-token", adminToken.trim());
     } catch (err) {
+      localStorage.removeItem("my-financing-admin-token");
       setError(err.message);
       setMessages((current) => current.slice(0, -1));
     } finally {
@@ -1133,6 +1541,10 @@ function typeName(type) {
 
 function frequencyName(frequency) {
   return { daily: "每日", weekly: "每周", monthly: "每月" }[frequency] || frequency;
+}
+
+function weekdayName(day) {
+  return ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"][Number(day)] || "";
 }
 
 function statusName(status) {

@@ -15,7 +15,7 @@ class FundOut(BaseModel):
 class TransactionCreate(BaseModel):
     fund_code: str = Field(min_length=1, max_length=16)
     fund_name: str | None = None
-    trade_date: date
+    trade_date: date | None = None
     transaction_type: str = Field(pattern="^(buy|sell|dividend|fee)$")
     amount: Decimal = Decimal("0")
     shares: Decimal = Decimal("0")
@@ -32,13 +32,9 @@ class TransactionOut(TransactionCreate):
     import_source: str | None = None
     initiated_at: datetime | None = None
     confirmed_at: datetime | None = None
+    status: str = "confirmed"
 
     model_config = {"from_attributes": True}
-
-
-class AlipayPdfImportRequest(BaseModel):
-    path: str
-    dry_run: bool = True
 
 
 class ImportErrorItem(BaseModel):
@@ -67,9 +63,19 @@ class DcaPlanCreate(BaseModel):
     status: str = Field(default="active", pattern="^(active|paused)$")
 
 
+class DcaPlanUpdate(BaseModel):
+    amount: Decimal | None = None
+    fee: Decimal | None = None
+    end_date: date | None = None
+    frequency: str | None = Field(default=None, pattern="^(daily|weekly|monthly)$")
+    day_of_month: int | None = Field(default=None, ge=1, le=31)
+    status: str | None = Field(default=None, pattern="^(active|paused)$")
+
+
 class DcaPlanOut(BaseModel):
     id: int
     fund_code: str
+    fund_name: str | None = None
     amount: Decimal
     fee: Decimal = Decimal("0")
     start_date: date | None
@@ -119,6 +125,8 @@ class HoldingOut(BaseModel):
     confirmed_cumulative_profit: Decimal
     confirmed_cumulative_profit_rate: Decimal
     realized_cash: Decimal
+    previous_nav: Decimal | None = None
+    daily_pnl: Decimal | None = None
 
 
 class PortfolioSummaryOut(BaseModel):
@@ -150,6 +158,13 @@ class AdviceOut(BaseModel):
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1)
+
+
+class FundPerformancePoint(BaseModel):
+    nav_date: date
+    unit_nav: Decimal
+    daily_growth_rate: Decimal | None = None
+    cumulative_return: Decimal | None = None
 
 
 class ChatRequest(BaseModel):

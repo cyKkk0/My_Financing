@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target nginx.service
+
+[Service]
+Type=simple
+User=cykkk
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:80
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,49 @@
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
+
+
+@lru_cache(maxsize=1)
+def load_trading_calendar() -> set[date]:
+    """Return a set of Chinese stock market trading dates, cached.
+
+    The AKShare data typically covers the current calendar year.
+    When the exchange publishes next year's calendar (usually late
+    Q4), a cache refresh will pick it up.
+    """
+    import akshare as ak
+
+    df = ak.tool_trade_date_hist_sina()
+    if df.empty or "trade_date" not in df.columns:
+        return set()
+    return {pd.to_datetime(d).date() for d in df["trade_date"]}
+
+
+def trading_calendar_coverage_end() -> date | None:
+    """Return the last date covered by the cached trading calendar."""
+    cal = load_trading_calendar()
+    return max(cal) if cal else None
+
+
+def refresh_trading_calendar() -> set[date]:
+    """Clear cached trading calendar and reload from AKShare.
+
+    Returns the freshly loaded calendar.
+    """
+    load_trading_calendar.cache_clear()
+    return load_trading_calendar()
+
+
+def next_trading_day(d: date, trading_days: set[date]) -> date:
+    """Return d if it is a trading day, else the next trading day."""
+    from datetime import timedelta
+
+    while d not in trading_days:
+        d += timedelta(days=1)
+    return d
 
 
 class AkshareFundClient:
@@ -96,6 +137,7 @@ class AkshareFundClient:
         if nav_column is None:
             return []
 
+        growth_column = _first_present_column(df, ["日增长率", "日涨幅", "日增长"])
         rows: list[dict[str, Any]] = []
         for record in df.to_dict(orient="records"):
             unit_nav = _decimal_or_none(record.get(nav_column))
@@ -107,7 +149,7 @@ class AkshareFundClient:
                     "nav_date": nav_date,
                     "unit_nav": unit_nav,
                     "accumulated_nav": None,
-                    "daily_growth_rate": None,
+                    "daily_growth_rate": _decimal_or_none(record.get(growth_column)) if growth_column else None,
                 }
             )
         return rows

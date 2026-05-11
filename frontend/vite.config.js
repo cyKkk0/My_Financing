@@ -4,5 +4,11 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   base: process.env.GITHUB_PAGES === "true" ? "/My_Financing/" : "/",
+  server: {
+    allowedHosts: [".trycloudflare.com"],
+    proxy: {
+      "/api": "http://localhost:8000",
+    },
+  },
 });
 

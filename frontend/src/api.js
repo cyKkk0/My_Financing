@@ -22,8 +22,8 @@ export function getPortfolioSummary() {
   return request("/portfolio/summary");
 }
 
-export function getSnapshots() {
-  return request("/portfolio/snapshots");
+export function getSnapshots(period = "month") {
+  return request(`/portfolio/snapshots?period=${period}`);
 }
 
 export function getLatestAdvice() {
@@ -64,6 +64,10 @@ export function getFundNav(fundCode, tradeDate) {
   return request(`/funds/${fundCode}/nav?trade_date=${tradeDate}`);
 }
 
+export function getFundPerformance(fundCode, range = "month") {
+  return request(`/funds/${fundCode}/performance?range=${range}`);
+}
+
 export function createTransaction(payload) {
   return request("/transactions", {
     method: "POST",
@@ -87,11 +91,22 @@ export function deleteTransactionsBatch({ fundCode, startDate, endDate }) {
   });
 }
 
-export function importAlipayPdf(path, dryRun = true) {
-  return request("/transactions/import/alipay-pdf", {
+export async function importAlipayPdf(file, dryRun = true) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("dry_run", dryRun);
+
+  const response = await fetch(`${API_BASE}/transactions/import/alipay-pdf`, {
     method: "POST",
-    body: JSON.stringify({ path, dry_run: dryRun }),
+    body: formData,
   });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Request failed: ${response.status}`);
+  }
+
+  return response.json();
 }
 
 export function createDcaPlan(payload) {
@@ -101,8 +116,24 @@ export function createDcaPlan(payload) {
   });
 }
 
+export function updateDcaPlan(planId, payload) {
+  return request(`/dca-plans/${planId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function deleteDcaPlan(planId) {
   return request(`/dca-plans/${planId}`, { method: "DELETE" });
+}
+
+export function confirmPendingTransactions(adminToken) {
+  return request("/jobs/confirm-pending-transactions", {
+    method: "POST",
+    headers: {
+      "X-Admin-Token": adminToken,
+    },
+  });
 }
 
 export function runDailyUpdate(adminToken) {

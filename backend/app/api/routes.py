@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -13,18 +13,24 @@ from app.jobs.update_daily import run_dca_check, update_daily_navs_and_snapshot
 from app.schemas import (
     AdviceOut,
     AlipayPdfImportOut,
-    AlipayPdfImportRequest,
     ChatRequest,
     DcaExecutionOut,
     DcaPlanCreate,
     DcaPlanOut,
+    DcaPlanUpdate,
+    FundPerformancePoint,
     PortfolioSummaryOut,
     TransactionCreate,
     TransactionOut,
 )
 from app.services.ai_advisor import generate_advice, stream_chat_advice
-from app.services.akshare_client import AkshareFundClient
-from app.services.alipay_pdf import ParsedAlipayTransaction, apply_resolved_trade_date, parse_alipay_pdf
+from app.services.akshare_client import (
+    AkshareFundClient,
+    load_trading_calendar,
+    refresh_trading_calendar,
+    trading_calendar_coverage_end,
+)
+from app.services.alipay_pdf import ParsedAlipayTransaction, apply_resolved_trade_date, parse_alipay_pdf, parse_alipay_pdf_bytes
 from app.services.portfolio import calculate_portfolio_summary, save_snapshot
 
 router = APIRouter()
@@ -38,15 +44,31 @@ def health() -> dict[str, str]:
 @router.post("/transactions", response_model=TransactionOut)
 def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)) -> models.Transaction:
     fund_name = payload.fund_name or _resolve_fund_name(payload.fund_code)
+    if not fund_name:
+        raise HTTPException(status_code=400, detail=f"无法识别基金代码 {payload.fund_code}，未找到对应的基金名称")
+    initiated_at = payload.initiated_at or datetime.now()
+    if payload.initiated_at is not None:
+        trade_date = _resolve_trade_date(initiated_at)
+    else:
+        trade_date = payload.trade_date or datetime.now().date()
+
     resolved_nav = payload.nav
-    resolved_nav_date = payload.trade_date
+    resolved_nav_date = trade_date
     resolved_nav_source = "manual"
+    status = "confirmed"
     if resolved_nav is None:
-        nav_info = _resolve_nav(payload.fund_code, payload.trade_date, db)
+        nav_info = _resolve_nav(payload.fund_code, trade_date, db)
         if nav_info is not None:
             resolved_nav = Decimal(nav_info["unit_nav"])
             resolved_nav_date = nav_info["nav_date"]
             resolved_nav_source = str(nav_info["source"])
+        # If the resolved NAV date is before trade_date, the exact trade_date NAV
+        # is not yet available. For user-initiated buy/sell orders, mark as pending
+        # so a daily job can confirm it once the NAV is published.
+        if payload.transaction_type in ("buy", "sell"):
+            if resolved_nav is None or resolved_nav_date < trade_date:
+                if payload.initiated_at is not None:
+                    status = "pending"
 
     amount, shares = _resolve_transaction_numbers(
         payload.transaction_type,
@@ -64,14 +86,15 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
 
     tx = models.Transaction(
         fund_code=payload.fund_code,
-        trade_date=payload.trade_date,
+        trade_date=trade_date,
         transaction_type=payload.transaction_type,
         amount=amount,
         shares=shares,
         nav=resolved_nav,
         fee=payload.fee,
         note=payload.note,
-        initiated_at=payload.initiated_at or datetime.now(),
+        initiated_at=initiated_at,
+        status=status,
     )
     db.add(tx)
     if resolved_nav is not None:
@@ -173,13 +196,16 @@ def _serialize_transactions(db: Session, transactions: list[models.Transaction])
             "id": tx.id,
             "fund_code": tx.fund_code,
             "fund_name": fund_names.get(tx.fund_code, tx.fund_code),
-            "trade_date": tx.trade_date,
+            "trade_date": tx.trade_date.isoformat() if tx.trade_date else None,
             "transaction_type": tx.transaction_type,
             "amount": tx.amount,
             "shares": tx.shares,
             "nav": tx.nav,
             "fee": tx.fee,
             "note": tx.note,
+            "initiated_at": tx.initiated_at.isoformat() if tx.initiated_at else None,
+            "confirmed_at": tx.confirmed_at.isoformat() if tx.confirmed_at else None,
+            "status": tx.status,
         }
         for tx in transactions
     ]
@@ -251,9 +277,14 @@ def delete_transactions_batch(
 
 
 @router.post("/transactions/import/alipay-pdf", response_model=AlipayPdfImportOut)
-def import_alipay_pdf(payload: AlipayPdfImportRequest, db: Session = Depends(get_db)) -> AlipayPdfImportOut:
+async def import_alipay_pdf(
+    file: UploadFile = File(...),
+    dry_run: bool = Form(True),
+    db: Session = Depends(get_db),
+) -> AlipayPdfImportOut:
     try:
-        parsed = parse_alipay_pdf(payload.path)
+        pdf_bytes = await file.read()
+        parsed = parse_alipay_pdf_bytes(pdf_bytes)
         _resolve_alipay_trade_dates(parsed)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {exc}") from exc
@@ -264,13 +295,13 @@ def import_alipay_pdf(payload: AlipayPdfImportRequest, db: Session = Depends(get
     errors: list[dict[str, int | str]] = []
     existing_transactions = _existing_transactions_by_external_id(db, parsed)
     existing_funds = {fund.code: fund for fund in db.scalars(select(models.Fund)).all()}
-    fund_name_map = _safe_fund_name_map() if not payload.dry_run else {}
+    fund_name_map = _safe_fund_name_map() if not dry_run else {}
 
     for row_number, item in enumerate(parsed, start=1):
         try:
             existing = _find_existing_transaction(db, item, existing_transactions)
             if existing is not None:
-                if payload.dry_run:
+                if dry_run:
                     if _imported_transaction_would_change(existing, item):
                         updated += 1
                     else:
@@ -282,7 +313,8 @@ def import_alipay_pdf(payload: AlipayPdfImportRequest, db: Session = Depends(get
                 else:
                     skipped += 1
                 continue
-            if payload.dry_run:
+            if dry_run:
+                created += 1
                 continue
 
             _ensure_fund(db, item.fund_code, existing_funds, fund_name_map)
@@ -305,7 +337,7 @@ def import_alipay_pdf(payload: AlipayPdfImportRequest, db: Session = Depends(get
         except Exception as exc:
             errors.append({"row": row_number, "error": str(exc)})
 
-    if not payload.dry_run:
+    if not dry_run:
         _sync_imported_alipay_navs(db, {item.fund_code for item in parsed})
         db.commit()
 
@@ -329,6 +361,13 @@ def create_dca_plan(payload: DcaPlanCreate, db: Session = Depends(get_db)) -> mo
     elif fund_name and (fund.name == fund.code or fund.name.isdigit()):
         fund.name = fund_name
 
+    if payload.day_of_month:
+        day_of_month = payload.day_of_month
+    elif payload.frequency == "weekly":
+        day_of_month = payload.start_date.isoweekday()
+    else:
+        day_of_month = payload.start_date.day
+
     plan = models.DcaPlan(
         fund_code=payload.fund_code,
         amount=payload.amount,
@@ -336,7 +375,7 @@ def create_dca_plan(payload: DcaPlanCreate, db: Session = Depends(get_db)) -> mo
         start_date=payload.start_date,
         end_date=payload.end_date,
         frequency=payload.frequency,
-        day_of_month=payload.day_of_month or payload.start_date.day,
+        day_of_month=day_of_month,
         status=payload.status,
     )
     db.add(plan)
@@ -346,8 +385,52 @@ def create_dca_plan(payload: DcaPlanCreate, db: Session = Depends(get_db)) -> mo
 
 
 @router.get("/dca-plans", response_model=list[DcaPlanOut])
-def list_dca_plans(db: Session = Depends(get_db)) -> list[models.DcaPlan]:
-    return list(db.scalars(select(models.DcaPlan).order_by(models.DcaPlan.created_at.desc())).all())
+def list_dca_plans(db: Session = Depends(get_db)) -> list[DcaPlanOut]:
+    plans = list(db.scalars(select(models.DcaPlan).order_by(models.DcaPlan.created_at.desc())).all())
+    if not plans:
+        return []
+    fund_codes = {plan.fund_code for plan in plans}
+    fund_names = {
+        fund.code: fund.name
+        for fund in db.scalars(select(models.Fund).where(models.Fund.code.in_(fund_codes))).all()
+    }
+    return [
+        DcaPlanOut(
+            id=p.id,
+            fund_code=p.fund_code,
+            fund_name=fund_names.get(p.fund_code, p.fund_code),
+            amount=p.amount,
+            fee=p.fee,
+            start_date=p.start_date,
+            end_date=p.end_date,
+            frequency=p.frequency,
+            day_of_month=p.day_of_month,
+            status=p.status,
+        )
+        for p in plans
+    ]
+
+
+@router.put("/dca-plans/{plan_id}", response_model=DcaPlanOut)
+def update_dca_plan(plan_id: int, payload: DcaPlanUpdate, db: Session = Depends(get_db)) -> models.DcaPlan:
+    plan = db.get(models.DcaPlan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="定投计划不存在")
+    if payload.amount is not None:
+        plan.amount = payload.amount
+    if payload.fee is not None:
+        plan.fee = payload.fee
+    if payload.end_date is not None:
+        plan.end_date = payload.end_date
+    if payload.frequency is not None:
+        plan.frequency = payload.frequency
+    if payload.day_of_month is not None:
+        plan.day_of_month = payload.day_of_month
+    if payload.status is not None:
+        plan.status = payload.status
+    db.commit()
+    db.refresh(plan)
+    return plan
 
 
 @router.delete("/dca-plans/{plan_id}")
@@ -384,6 +467,98 @@ def get_fund_nav(fund_code: str, trade_date: date, db: Session = Depends(get_db)
     }
 
 
+@router.get("/funds/{fund_code}/performance", response_model=list[FundPerformancePoint])
+def fund_performance(
+    fund_code: str,
+    range: str = "month",
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    code = fund_code.zfill(6)
+    days = _range_days(range)
+    start_date = date.today() - timedelta(days=days)
+
+    # Find the earliest buy transaction to use as cost basis
+    first_buy = db.scalar(
+        select(models.Transaction.trade_date)
+        .where(
+            models.Transaction.fund_code == code,
+            models.Transaction.transaction_type == "buy",
+            models.Transaction.status == "confirmed",
+        )
+        .order_by(models.Transaction.trade_date.asc())
+        .limit(1)
+    )
+    cost_basis_date = max(first_buy, start_date) if first_buy else start_date
+
+    # Merge stored NAVs and AKShare history for complete coverage
+    stored = {
+        nav.nav_date: nav
+        for nav in db.scalars(
+            select(models.FundNav)
+            .where(models.FundNav.fund_code == code, models.FundNav.nav_date >= start_date)
+            .order_by(models.FundNav.nav_date.asc())
+        ).all()
+    }
+    try:
+        for row in AkshareFundClient().history_navs(code):
+            nav_date = row["nav_date"]
+            if nav_date < start_date:
+                continue
+            if nav_date in stored:
+                s = stored[nav_date]
+                if s.daily_growth_rate is None and row.get("daily_growth_rate") is not None:
+                    s.daily_growth_rate = row["daily_growth_rate"]
+            else:
+                stored[nav_date] = models.FundNav(
+                    fund_code=code,
+                    nav_date=nav_date,
+                    unit_nav=row["unit_nav"],
+                    daily_growth_rate=row.get("daily_growth_rate"),
+                    source="akshare_history",
+                )
+                db.add(stored[nav_date])
+        db.commit()
+    except Exception:
+        pass
+
+    sorted_navs = sorted(stored.values(), key=lambda n: n.nav_date)
+    if not sorted_navs:
+        return []
+
+    # Cost basis: NAV on or after cost_basis_date
+    cost_basis_nav: Decimal | None = None
+    for nav in sorted_navs:
+        if nav.nav_date >= cost_basis_date:
+            cost_basis_nav = Decimal(nav.unit_nav)
+            break
+    if cost_basis_nav is None:
+        cost_basis_nav = Decimal(sorted_navs[-1].unit_nav)
+
+    result: list[dict[str, object]] = []
+    prev_nav: Decimal | None = None
+    for nav in sorted_navs:
+        growth = nav.daily_growth_rate
+        if growth is None and prev_nav is not None and prev_nav != 0:
+            growth = (Decimal(nav.unit_nav) - prev_nav) / prev_nav
+        if nav.nav_date >= cost_basis_date:
+            cumulative = (Decimal(nav.unit_nav) - cost_basis_nav) / cost_basis_nav
+        else:
+            cumulative = Decimal("0")
+        result.append({
+            "nav_date": nav.nav_date.isoformat(),
+            "unit_nav": str(nav.unit_nav),
+            "daily_growth_rate": str(growth.quantize(Decimal("0.000001"))) if growth is not None else None,
+            "cumulative_return": str(cumulative.quantize(Decimal("0.000001"))) if cumulative is not None else None,
+        })
+        prev_nav = Decimal(nav.unit_nav)
+    return result
+
+
+def _range_days(range_key: str) -> int:
+    mapping = {"week": 7, "month": 30, "3month": 90, "6month": 180, "year": 365}
+    return mapping.get(range_key, 30)
+
+
 @router.get("/portfolio/summary", response_model=PortfolioSummaryOut)
 def portfolio_summary(db: Session = Depends(get_db)) -> PortfolioSummaryOut:
     return calculate_portfolio_summary(db)
@@ -396,10 +571,23 @@ def create_snapshot(db: Session = Depends(get_db)) -> dict[str, str]:
 
 
 @router.get("/portfolio/snapshots")
-def list_snapshots(db: Session = Depends(get_db)) -> list[dict[str, str]]:
-    snapshots = db.scalars(
-        select(models.PortfolioSnapshot).order_by(models.PortfolioSnapshot.snapshot_date.asc())
-    ).all()
+def list_snapshots(period: str = "month", db: Session = Depends(get_db)) -> list[dict[str, str]]:
+    from datetime import date, timedelta
+
+    cutoff_map = {
+        "week": date.today() - timedelta(days=7),
+        "month": date.today() - timedelta(days=30),
+        "3months": date.today() - timedelta(days=90),
+        "6months": date.today() - timedelta(days=180),
+        "year": date.today() - timedelta(days=365),
+    }
+    cutoff = cutoff_map.get(period)
+
+    stmt = select(models.PortfolioSnapshot).order_by(models.PortfolioSnapshot.snapshot_date.asc())
+    if cutoff is not None:
+        stmt = stmt.where(models.PortfolioSnapshot.snapshot_date >= cutoff)
+
+    snapshots = db.scalars(stmt).all()
     return [
         {
             "date": item.snapshot_date.isoformat(),
@@ -407,6 +595,7 @@ def list_snapshots(db: Session = Depends(get_db)) -> list[dict[str, str]]:
             "total_invested": str(item.total_invested),
             "profit": str(item.profit),
             "profit_rate": str(item.profit_rate),
+            "cumulative_profit": str(item.cumulative_profit) if item.cumulative_profit is not None else None,
         }
         for item in snapshots
     ]
@@ -430,6 +619,33 @@ def dca_check(
 ) -> dict[str, int]:
     _require_admin_token(settings, x_admin_token)
     return run_dca_check(db)
+
+
+@router.post("/jobs/confirm-pending-transactions")
+def confirm_pending(
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, int]:
+    _require_admin_token(settings, x_admin_token)
+    from app.jobs.update_daily import confirm_pending_transactions
+    return confirm_pending_transactions(db)
+
+
+@router.post("/jobs/refresh-trading-calendar")
+def refresh_calendar(
+    settings: Settings = Depends(get_settings),
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    _require_admin_token(settings, x_admin_token)
+    old_end = trading_calendar_coverage_end()
+    new_cal = refresh_trading_calendar()
+    new_end = trading_calendar_coverage_end()
+    return {
+        "previous_coverage_end": old_end.isoformat() if old_end else None,
+        "new_coverage_end": new_end.isoformat() if new_end else None,
+        "total_trading_days": len(new_cal),
+    }
 
 
 @router.post("/funds/refresh-names")
@@ -725,6 +941,41 @@ def _resolve_nav(fund_code: str, trade_date: date, db: Session) -> dict[str, Dec
         .order_by(models.FundNav.nav_date.desc())
         .limit(1)
     )
+
+    akshare_result = None
+    if stored is None or stored.nav_date < trade_date:
+        try:
+            akshare_result = AkshareFundClient().nav_on_or_before(fund_code, trade_date)
+        except Exception:
+            pass
+
+    if akshare_result is not None:
+        akshare_date = akshare_result["nav_date"]
+        if stored is None or akshare_date > stored.nav_date:
+            _upsert_nav_from_akshare(db, fund_code, akshare_result)
+            return {
+                "nav_date": akshare_date,
+                "unit_nav": Decimal(akshare_result["unit_nav"]),
+                "source": akshare_result["source"],
+            }
+
+    if stored is not None:
+        return {
+            "nav_date": stored.nav_date,
+            "unit_nav": Decimal(stored.unit_nav),
+            "source": stored.source,
+        }
+
+    return None
+
+
+def _resolve_nav_exact(fund_code: str, trade_date: date, db: Session) -> dict[str, Decimal | date | str] | None:
+    """Return NAV only if it exists for the exact trade_date, otherwise None."""
+    stored = db.scalar(
+        select(models.FundNav)
+        .where(models.FundNav.fund_code == fund_code, models.FundNav.nav_date == trade_date)
+        .limit(1)
+    )
     if stored is not None:
         return {
             "nav_date": stored.nav_date,
@@ -733,9 +984,91 @@ def _resolve_nav(fund_code: str, trade_date: date, db: Session) -> dict[str, Dec
         }
 
     try:
-        return AkshareFundClient().nav_on_or_before(fund_code, trade_date)
+        client = AkshareFundClient()
+        history = {row["nav_date"]: row for row in client.history_navs(fund_code)}
+        if trade_date in history:
+            row = history[trade_date]
+            return {
+                "nav_date": row["nav_date"],
+                "unit_nav": row["unit_nav"],
+                "source": "akshare_history",
+            }
     except Exception:
-        return None
+        pass
+    return None
+
+
+def _upsert_nav_from_akshare(db: Session, fund_code: str, nav_data: dict) -> None:
+    """Create or update a FundNav record from AKShare data."""
+    from sqlalchemy.exc import IntegrityError
+
+    nav = db.scalar(
+        select(models.FundNav).where(
+            models.FundNav.fund_code == fund_code,
+            models.FundNav.nav_date == nav_data["nav_date"],
+        )
+    )
+    if nav is not None:
+        nav.unit_nav = nav_data["unit_nav"]
+        if nav_data.get("accumulated_nav") is not None:
+            nav.accumulated_nav = nav_data["accumulated_nav"]
+        if nav_data.get("daily_growth_rate") is not None:
+            nav.daily_growth_rate = nav_data["daily_growth_rate"]
+        return
+
+    try:
+        nav = models.FundNav(
+            fund_code=fund_code,
+            nav_date=nav_data["nav_date"],
+            unit_nav=nav_data["unit_nav"],
+            accumulated_nav=nav_data.get("accumulated_nav"),
+            daily_growth_rate=nav_data.get("daily_growth_rate"),
+            source=nav_data.get("source", "akshare_history"),
+        )
+        db.add(nav)
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        # Another worker or prior call already inserted this row; update it instead
+        nav = db.scalar(
+            select(models.FundNav).where(
+                models.FundNav.fund_code == fund_code,
+                models.FundNav.nav_date == nav_data["nav_date"],
+            )
+        )
+        if nav is not None:
+            nav.unit_nav = nav_data["unit_nav"]
+            if nav_data.get("accumulated_nav") is not None:
+                nav.accumulated_nav = nav_data["accumulated_nav"]
+            if nav_data.get("daily_growth_rate") is not None:
+                nav.daily_growth_rate = nav_data["daily_growth_rate"]
+
+
+def _resolve_trade_date(initiated_at: datetime) -> date:
+    """Determine trade date (T day) from order initiation time.
+
+    Rules:
+    - Orders initiated before 15:00 on a trading day → T = same day
+    - Orders initiated at/after 15:00 on a trading day → T = next trading day
+    - Orders initiated on a non-trading day → T = next trading day
+    - Trading days from AKShare (covers weekends + Chinese holidays)
+    """
+    trading_days = load_trading_calendar()
+    if not trading_days:
+        d = initiated_at.date()
+        if initiated_at.hour >= 15:
+            d += timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+
+    if initiated_at.hour >= 15:
+        d = initiated_at.date() + timedelta(days=1)
+    else:
+        d = initiated_at.date()
+    while d not in trading_days:
+        d += timedelta(days=1)
+    return d
 
 
 def _resolve_transaction_numbers(

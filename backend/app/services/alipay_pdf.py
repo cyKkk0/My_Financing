@@ -51,6 +51,11 @@ def parse_alipay_pdf(path: str) -> list[ParsedAlipayTransaction]:
     return _parse_raw_text(text)
 
 
+def parse_alipay_pdf_bytes(pdf_bytes: bytes) -> list[ParsedAlipayTransaction]:
+    text = _extract_text_from_bytes(pdf_bytes)
+    return _parse_raw_text(text)
+
+
 def _extract_text(path: str) -> str:
     pdf_path = Path(path).expanduser()
     if not pdf_path.exists():
@@ -63,6 +68,16 @@ def _extract_text(path: str) -> str:
         text=True,
     )
     return result.stdout
+
+
+def _extract_text_from_bytes(pdf_bytes: bytes) -> str:
+    result = subprocess.run(
+        ["pdftotext", "-raw", "-", "-"],
+        input=pdf_bytes,
+        check=True,
+        capture_output=True,
+    )
+    return result.stdout.decode()
 
 
 def _parse_raw_text(text: str) -> list[ParsedAlipayTransaction]:

@@ -50,6 +50,7 @@ class Transaction(Base):
     import_source: Mapped[str | None] = mapped_column(String(32))
     initiated_at: Mapped[datetime | None] = mapped_column(DateTime)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default="confirmed")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -97,6 +98,8 @@ class PortfolioSnapshot(Base):
     realized_cash: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     profit: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     profit_rate: Mapped[Decimal] = mapped_column(Numeric(10, 4))
+    cumulative_profit: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    cumulative_profit_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

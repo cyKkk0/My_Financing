@@ -1,16 +1,32 @@
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.akshare_client import AkshareFundClient
-from app.services.portfolio import save_snapshot
+from app.services.akshare_client import (
+    AkshareFundClient,
+    load_trading_calendar,
+    refresh_trading_calendar,
+    trading_calendar_coverage_end,
+)
+from app.services.portfolio import backfill_snapshots, save_snapshot
+
+
+def _maybe_refresh_trading_calendar() -> None:
+    """Refresh trading calendar cache if coverage is running low (< 7 days)."""
+    end = trading_calendar_coverage_end()
+    if end is None:
+        refresh_trading_calendar()
+        return
+    if (end - date.today()).days < 7:
+        refresh_trading_calendar()
 
 
 def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
+    _maybe_refresh_trading_calendar()
     client = AkshareFundClient()
     fund_codes = _fund_codes_to_update(db)
     fund_names = client.fund_name_map()
@@ -41,12 +57,22 @@ def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
         )
 
     db.commit()
+    pending_result = confirm_pending_transactions(db, client)
+    dca_result = process_due_dca_plans(db, client, date.today())
+    db.commit()
+    backfilled = backfill_snapshots(db)
     snapshot = save_snapshot(db, date.today())
     return {
         "updated_funds": updated,
         "skipped_funds": ",".join(skipped),
         "updated_navs": ";".join(updated_details),
         "snapshot_date": snapshot.snapshot_date.isoformat(),
+        "backfilled_snapshots": backfilled,
+        "pending_confirmed": pending_result["confirmed"],
+        "pending_remaining": pending_result["pending_transactions"],
+        "dca_created": dca_result["created"],
+        "dca_confirmed": dca_result["confirmed"],
+        "dca_pending": dca_result["pending"],
     }
 
 
@@ -112,6 +138,7 @@ def process_due_dca_plans(
             db.add(execution)
             created += 1
 
+    db.flush()
     confirmed = _confirm_pending_dca_executions(db, client, target_date)
     pending_count = db.scalar(
         select(func.count()).select_from(models.DcaExecution).where(models.DcaExecution.status == "pending")
@@ -120,12 +147,12 @@ def process_due_dca_plans(
 
 
 def _confirm_pending_dca_executions(db: Session, client: AkshareFundClient, target_date: date) -> int:
-    """Confirm pending DCA executions that have passed their T+N confirmation date.
+    """Confirm pending DCA executions whose trade-date NAV is now available.
 
     For each pending execution:
-      1. T = first trading day >= scheduled_date (the NAV date)
-      2. N = fund's buy confirmation days (T+N from AKShare, default 1)
-      3. Confirm only when target_date >= T + N trading days
+      1. Find the first trading day T >= scheduled_date
+      2. If NAV data exists for T, confirm immediately and create a transaction
+      3. Otherwise leave pending (NAV not yet published)
     """
     executions = db.scalars(
         select(models.DcaExecution)
@@ -135,10 +162,8 @@ def _confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targ
     if not executions:
         return 0
 
-    calendars: dict[str, list[date]] = {}        # fund_code → sorted trading dates
-    nav_values: dict[str, dict[date, Decimal]] = {}  # fund_code → {date: unit_nav}
-    confirm_days_map: dict[str, int] = {}         # fund_code → T+N
-    plans: dict[int, models.DcaPlan] = {}          # plan_id → plan
+    nav_cache: dict[str, dict[date, Decimal]] = {}  # fund_code → {date: unit_nav}
+    plans: dict[int, models.DcaPlan] = {}              # plan_id → plan
 
     confirmed = 0
     for execution in executions:
@@ -148,59 +173,56 @@ def _confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targ
             if execution.plan_id not in plans:
                 plans[execution.plan_id] = db.get(models.DcaPlan, execution.plan_id)
             plan = plans[execution.plan_id]
-            # ── fetch trading calendar + NAV values once per fund ──
-            if fund not in calendars:
-                history = client.history_navs(fund)
-                calendars[fund] = sorted({row["nav_date"] for row in history})
-                nav_values[fund] = {row["nav_date"]: row["unit_nav"] for row in history}
 
-            trading_days = calendars[fund]
-            if not trading_days:
+            # ── T = first trading day >= scheduled_date ──
+            trade_date = execution.scheduled_date
+            # Advance to next trading day if scheduled_date is a non-trading day
+            trading_days = load_trading_calendar()
+            if trading_days:
+                while trade_date not in trading_days:
+                    trade_date += timedelta(days=1)
+            else:
+                while trade_date.weekday() >= 5:
+                    trade_date += timedelta(days=1)
+
+            # ── fetch NAV once per fund ──
+            if fund not in nav_cache:
+                nav_cache[fund] = {}
+                # Try stored NAVs first
+                stored = db.scalars(
+                    select(models.FundNav).where(
+                        models.FundNav.fund_code == fund,
+                        models.FundNav.nav_date >= trade_date,
+                    ).order_by(models.FundNav.nav_date.asc())
+                ).all()
+                for s in stored:
+                    nav_cache[fund][s.nav_date] = Decimal(s.unit_nav)
+                # Supplement with AKShare history
+                try:
+                    for row in client.history_navs(fund):
+                        d = row["nav_date"]
+                        if d >= trade_date and d not in nav_cache[fund]:
+                            nav_cache[fund][d] = row["unit_nav"]
+                except Exception:
+                    pass
+
+            fund_navs = nav_cache[fund]
+            if not fund_navs:
                 execution.note = "暂无净值数据"
                 continue
 
-            # ── trade date T: first trading day >= scheduled_date ──
-            trade_date: date | None = None
-            for d in trading_days:
-                if d >= execution.scheduled_date:
-                    trade_date = d
+            # ── Find NAV on or after trade_date ──
+            available_dates = sorted(fund_navs.keys())
+            nav_date: date | None = None
+            unit_nav: Decimal | None = None
+            for d in available_dates:
+                if d >= trade_date:
+                    nav_date = d
+                    unit_nav = fund_navs[d]
                     break
-            if trade_date is None:
-                continue
 
-            # ── confirmation days N ──
-            if fund not in confirm_days_map:
-                cd = client.trade_confirm_days(fund, "buy")
-                confirm_days_map[fund] = cd if cd is not None else 1
-            confirm_days = confirm_days_map[fund]
-
-            # ── confirmation date = T + N trading days ──
-            try:
-                t_idx = trading_days.index(trade_date)
-                confirm_idx = t_idx + confirm_days
-                if confirm_idx >= len(trading_days):
-                    execution.note = f"待T+{confirm_days}确认(净值日{trade_date})"
-                    continue
-                confirm_date = trading_days[confirm_idx]
-            except (ValueError, IndexError):
-                continue
-
-            if target_date < confirm_date:
-                execution.note = f"待T+{confirm_days}确认(净值日{trade_date} 确认日{confirm_date})"
-                continue
-
-            # ── NAV on trade date ──
-            unit_nav = nav_values[fund].get(trade_date)
-            if unit_nav is None:
-                stored = db.scalar(
-                    select(models.FundNav).where(
-                        models.FundNav.fund_code == fund,
-                        models.FundNav.nav_date == trade_date,
-                    )
-                )
-                unit_nav = Decimal(stored.unit_nav) if stored else None
-            if unit_nav is None or unit_nav <= 0:
-                execution.note = f"净值日{trade_date}无净值"
+            if nav_date is None or unit_nav is None or unit_nav <= 0:
+                execution.note = f"净值日{trade_date}暂无净值，等待数据更新"
                 continue
 
             # ── create buy transaction ──
@@ -208,40 +230,40 @@ def _confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targ
             shares = (Decimal(execution.amount) / nav_dec).quantize(
                 Decimal("0.0001"), rounding=ROUND_HALF_UP
             )
-            now = datetime.now()
             tx = models.Transaction(
                 fund_code=fund,
-                trade_date=trade_date,
+                trade_date=nav_date,
                 transaction_type="buy",
                 amount=execution.amount,
                 shares=shares,
                 nav=nav_dec,
                 fee=plan.fee if plan else Decimal("0"),
                 external_id=f"dca:plan-{execution.plan_id}:{execution.scheduled_date.isoformat()}",
-                initiated_at=now,
-                confirmed_at=now,
+                initiated_at=datetime.combine(execution.scheduled_date, datetime.min.time()),
+                confirmed_at=datetime.now(),
                 note=f"定投计划 #{execution.plan_id} 自动确认",
             )
             db.add(tx)
             db.flush()
 
+            # Ensure FundNav record exists
             nav_row = db.scalar(
                 select(models.FundNav).where(
                     models.FundNav.fund_code == fund,
-                    models.FundNav.nav_date == trade_date,
+                    models.FundNav.nav_date == nav_date,
                 )
             )
             if nav_row is None:
                 nav_row = models.FundNav(
                     fund_code=fund,
-                    nav_date=trade_date,
+                    nav_date=nav_date,
                     unit_nav=nav_dec,
                     source="akshare_history",
                 )
                 db.add(nav_row)
 
             execution.status = "confirmed"
-            execution.confirmed_date = trade_date
+            execution.confirmed_date = nav_date
             execution.nav = nav_dec
             execution.shares = shares
             execution.transaction_id = tx.id
@@ -251,6 +273,90 @@ def _confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targ
             continue
 
     return confirmed
+
+
+def confirm_pending_transactions(db: Session, client: AkshareFundClient | None = None) -> dict[str, int]:
+    """Confirm pending manual transactions whose trade_date NAV is now available.
+
+    Unlike DCA executions, manual pending transactions already have the trade_date
+    set (from the 15:00 cutoff rule). We just need to wait until the NAV for that
+    exact trade_date is published, then update nav/shares and mark confirmed.
+    """
+    client = client or AkshareFundClient()
+    pending = db.scalars(
+        select(models.Transaction)
+        .where(models.Transaction.status == "pending")
+        .order_by(models.Transaction.trade_date.asc())
+    ).all()
+    if not pending:
+        return {"pending_transactions": 0, "confirmed": 0}
+
+    confirmed = 0
+    for tx in pending:
+        try:
+            # Check if NAV exists for the exact trade_date
+            unit_nav = None
+            nav_source = "akshare_history"
+
+            stored = db.scalar(
+                select(models.FundNav).where(
+                    models.FundNav.fund_code == tx.fund_code,
+                    models.FundNav.nav_date == tx.trade_date,
+                )
+            )
+            if stored is not None:
+                unit_nav = Decimal(stored.unit_nav)
+                nav_source = stored.source
+            else:
+                history = {
+                    row["nav_date"]: row["unit_nav"]
+                    for row in client.history_navs(tx.fund_code)
+                }
+                unit_nav = history.get(tx.trade_date)
+
+            if unit_nav is None or unit_nav <= 0:
+                continue
+
+            nav_dec = Decimal(unit_nav)
+            tx.nav = nav_dec
+            if tx.transaction_type == "buy":
+                tx.shares = (tx.amount / nav_dec).quantize(
+                    Decimal("0.0001"), rounding=ROUND_HALF_UP
+                )
+            elif tx.transaction_type == "sell":
+                tx.amount = (tx.shares * nav_dec - tx.fee).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            tx.status = "confirmed"
+            tx.confirmed_at = datetime.now()
+
+            # Ensure FundNav record exists
+            nav_row = db.scalar(
+                select(models.FundNav).where(
+                    models.FundNav.fund_code == tx.fund_code,
+                    models.FundNav.nav_date == tx.trade_date,
+                )
+            )
+            if nav_row is None:
+                nav_row = models.FundNav(
+                    fund_code=tx.fund_code,
+                    nav_date=tx.trade_date,
+                    unit_nav=nav_dec,
+                    source=nav_source,
+                )
+                db.add(nav_row)
+
+            confirmed += 1
+        except Exception:
+            continue
+
+    if confirmed > 0:
+        db.commit()
+
+    remaining = db.scalar(
+        select(func.count()).select_from(models.Transaction).where(models.Transaction.status == "pending")
+    ) or 0
+    return {"pending_transactions": remaining, "confirmed": confirmed}
 
 
 def _fund_codes_to_update(db: Session) -> list[str]:
@@ -267,7 +373,8 @@ def _is_plan_due(plan: models.DcaPlan, target_date: date) -> bool:
     if plan.frequency == "daily":
         return True
     if plan.frequency == "weekly":
-        return (target_date - plan.start_date).days % 7 == 0
+        weekday = plan.day_of_month or plan.start_date.isoweekday()
+        return target_date.isoweekday() == weekday
 
     day = plan.day_of_month or plan.start_date.day
     _, last_day = calendar.monthrange(target_date.year, target_date.month)
