@@ -119,6 +119,13 @@ http://127.0.0.1:80  # Nginx: frontend/dist + /api -> FastAPI:8000
    - Service: `http://127.0.0.1:80`
 4. 复制 connector token。不要把 token 提交到代码或发到公开聊天里。
 
+服务器需预先准备这些环境，部署脚本只会验证并使用它们，不会自动安装系统包、Node.js、cloudflared 或 conda 环境：
+
+- Nginx、curl、openssl。
+- Node.js >= 20 和 npm。
+- cloudflared，并已能在命令行中执行。
+- conda 环境 `my-financing`，可通过 `cd backend && conda env create -f environment.yml` 创建。
+
 ### 一键部署脚本
 
 在 Linux 服务器项目根目录运行：
@@ -139,14 +146,23 @@ sudo deploy/deploy-cloudflare.sh \
   --cloudflared-token '你的 tunnel token'
 ```
 
+如果你已经手动运行过 `sudo cloudflared service install <token>`，并且 Cloudflare connector 已显示 connected，可以让脚本复用现有 cloudflared 服务：
+
+```bash
+sudo deploy/deploy-cloudflare.sh \
+  --user cykkk \
+  --domain myfinancing.asia \
+  --use-existing-cloudflared
+```
+
 脚本会自动完成：
 
-- 安装系统依赖：Nginx、Node.js、Python 基础工具、cloudflared。
+- 验证系统环境：Nginx、curl、openssl、Node.js、npm、cloudflared、conda 环境。
 - 写入 `backend/.env`：包含 `ADMIN_TOKEN`、`FRONTEND_ORIGINS` 等基础配置。
-- 安装后端依赖：优先使用 conda 环境 `my-financing`，找不到时回退到 `backend/.venv`。
+- 安装后端依赖：使用 conda 环境 `my-financing` 安装 `backend/requirements.txt`。
 - 构建前端：以 `VITE_API_BASE=/api` 生成 `frontend/dist`。
 - 配置 Nginx：静态托管前端，并将 `/api/` 反代到 `127.0.0.1:8000`。
-- 配置守护进程：创建并启动 `my-financing-api.service` 与 `cloudflared-tunnel.service`。
+- 配置守护进程：创建并启动 `my-financing-api.service`；如果未传 `--use-existing-cloudflared`，也会创建 `cloudflared-tunnel.service`。
 - 启动自动任务：安装 21:00 和 9:30 的 cron 定时任务。
 
 常用选项：
@@ -209,7 +225,7 @@ sudo deploy/update-release.sh \
 脚本会自动完成：
 
 - 拉取最新代码，除非传入 `--skip-git-pull`。
-- 更新后端 Python 依赖，优先使用 conda 环境 `my-financing`。
+- 更新后端 Python 依赖，使用 conda 环境 `my-financing`。
 - 重新构建前端 `frontend/dist`。
 - 检查并 reload Nginx。
 - 重启 `my-financing-api.service`。

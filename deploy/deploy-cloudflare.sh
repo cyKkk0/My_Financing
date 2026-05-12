@@ -9,6 +9,7 @@ CONDA_ENV_NAME="my-financing"
 ADMIN_TOKEN_VALUE="${ADMIN_TOKEN:-}"
 CLOUDFLARED_TOKEN_VALUE="${CLOUDFLARED_TOKEN:-}"
 INSTALL_SCHEDULED_TASKS=1
+MANAGE_CLOUDFLARED=1
 
 usage() {
   cat <<'EOF'
@@ -32,6 +33,7 @@ Options:
   --conda-env NAME            Prefer this conda env. Defaults to my-financing.
   --admin-token TOKEN         Backend admin token. Defaults to ADMIN_TOKEN or backend/.env.
   --cloudflared-token TOKEN   Cloudflare Tunnel token. Defaults to CLOUDFLARED_TOKEN.
+  --use-existing-cloudflared  Do not create a cloudflared service or require a token.
   --no-scheduled-tasks        Do not install cron jobs.
   -h, --help                  Show this help.
 EOF
@@ -67,6 +69,10 @@ while [ "$#" -gt 0 ]; do
       CLOUDFLARED_TOKEN_VALUE="$2"
       shift 2
       ;;
+    --use-existing-cloudflared)
+      MANAGE_CLOUDFLARED=0
+      shift
+      ;;
     --no-scheduled-tasks)
       INSTALL_SCHEDULED_TASKS=0
       shift
@@ -93,7 +99,7 @@ if [ ! -d "$APP_DIR/backend" ] || [ ! -d "$APP_DIR/frontend" ]; then
   exit 1
 fi
 
-if [ -z "$CLOUDFLARED_TOKEN_VALUE" ]; then
+if [ "$MANAGE_CLOUDFLARED" -eq 1 ] && [ -z "$CLOUDFLARED_TOKEN_VALUE" ]; then
   echo "Cloudflare Tunnel token is required. Pass --cloudflared-token or export CLOUDFLARED_TOKEN." >&2
   exit 1
 fi
@@ -106,27 +112,32 @@ if [ -z "$ADMIN_TOKEN_VALUE" ]; then
   ADMIN_TOKEN_VALUE="$(openssl rand -hex 24)"
 fi
 
-echo "=== 1/9 Install system packages ==="
-apt-get update
-apt-get install -y nginx curl ca-certificates python3 python3-venv python3-pip openssl
+echo "=== 1/9 Verify required system tools ==="
+missing_tools=()
+for tool in nginx curl openssl node npm; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    missing_tools+=("$tool")
+  fi
+done
+if [ "${#missing_tools[@]}" -gt 0 ]; then
+  echo "Missing required tools: ${missing_tools[*]}" >&2
+  echo "Please install them before running this script. The script will not install system packages automatically." >&2
+  exit 1
+fi
 
 NODE_MAJOR="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
 if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 20 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+  echo "Node.js >= 20 is required, found: $(node -v 2>/dev/null || echo missing)." >&2
+  echo "Please install or activate a suitable Node.js version before running this script." >&2
+  exit 1
 fi
 
-echo "=== 2/9 Install cloudflared ==="
+echo "=== 2/9 Verify cloudflared ==="
 if ! command -v cloudflared >/dev/null 2>&1; then
-  ARCH="$(dpkg --print-architecture)"
-  case "$ARCH" in
-    amd64|arm64) ;;
-    *) echo "Unsupported architecture for automatic cloudflared install: $ARCH" >&2; exit 1 ;;
-  esac
-  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb" -o /tmp/cloudflared.deb
-  dpkg -i /tmp/cloudflared.deb
-  rm -f /tmp/cloudflared.deb
+  echo "cloudflared is required. Install it before running this script." >&2
+  exit 1
 fi
+CLOUDFLARED_BIN="$(command -v cloudflared)"
 
 echo "=== 3/9 Write backend environment ==="
 touch "$BACKEND_ENV"
@@ -174,16 +185,18 @@ if [ -z "$PYTHON_BIN" ] && sudo -u "$APP_USER" bash -lc "command -v conda >/dev/
   rm -f /tmp/my-financing-python-path
 fi
 
-if [ -n "$PYTHON_BIN" ]; then
-  echo "Using conda env ${CONDA_ENV_NAME}: ${PYTHON_BIN}"
-  sudo -u "$APP_USER" "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt"
-else
-  echo "Conda env ${CONDA_ENV_NAME} not found; falling back to backend/.venv."
-  sudo -u "$APP_USER" python3 -m venv "$APP_DIR/backend/.venv"
-  sudo -u "$APP_USER" "$APP_DIR/backend/.venv/bin/pip" install --upgrade pip
-  sudo -u "$APP_USER" "$APP_DIR/backend/.venv/bin/pip" install -r "$APP_DIR/backend/requirements.txt"
-  UVICORN_BIN="$APP_DIR/backend/.venv/bin/uvicorn"
-  PYTHON_ENV_BIN="$APP_DIR/backend/.venv/bin"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "Conda env ${CONDA_ENV_NAME} is required but was not found." >&2
+  echo "Create it before running this script, for example: cd backend && conda env create -f environment.yml" >&2
+  exit 1
+fi
+echo "Using conda env ${CONDA_ENV_NAME}: ${PYTHON_BIN}"
+sudo -u "$APP_USER" "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt"
+
+if [ ! -x "$UVICORN_BIN" ]; then
+  echo "uvicorn was not found in ${CONDA_ENV_NAME}: ${UVICORN_BIN}" >&2
+  echo "Check backend/requirements.txt installation in the conda environment." >&2
+  exit 1
 fi
 
 echo "=== 5/9 Build frontend ==="
@@ -246,13 +259,14 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-install -d -m 700 /etc/my-financing
-cat > /etc/my-financing/cloudflared.env <<EOF
+if [ "$MANAGE_CLOUDFLARED" -eq 1 ]; then
+  install -d -m 700 /etc/my-financing
+  cat > /etc/my-financing/cloudflared.env <<EOF
 CLOUDFLARED_TOKEN=${CLOUDFLARED_TOKEN_VALUE}
 EOF
-chmod 600 /etc/my-financing/cloudflared.env
+  chmod 600 /etc/my-financing/cloudflared.env
 
-cat > /etc/systemd/system/cloudflared-tunnel.service <<'EOF'
+  cat > /etc/systemd/system/cloudflared-tunnel.service <<EOF
 [Unit]
 Description=Cloudflare Tunnel for My Financing
 After=network.target nginx.service
@@ -260,17 +274,28 @@ After=network.target nginx.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/my-financing/cloudflared.env
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+ExecStart=${CLOUDFLARED_BIN} tunnel --no-autoupdate run --token \${CLOUDFLARED_TOKEN}
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 systemctl daemon-reload
-systemctl enable --now my-financing-api nginx cloudflared-tunnel
-systemctl restart my-financing-api nginx cloudflared-tunnel
+systemctl enable --now my-financing-api nginx
+systemctl restart my-financing-api nginx
+if [ "$MANAGE_CLOUDFLARED" -eq 1 ]; then
+  systemctl enable --now cloudflared-tunnel
+  systemctl restart cloudflared-tunnel
+elif systemctl list-unit-files cloudflared.service >/dev/null 2>&1; then
+  systemctl enable --now cloudflared
+elif systemctl list-unit-files cloudflared-tunnel.service >/dev/null 2>&1; then
+  systemctl enable --now cloudflared-tunnel
+else
+  echo "Warning: no cloudflared systemd service found. Ensure your manually installed connector is running." >&2
+fi
 
 echo "=== 8/9 Install scheduled tasks ==="
 if [ "$INSTALL_SCHEDULED_TASKS" -eq 1 ]; then
@@ -284,7 +309,13 @@ else
 fi
 
 echo "=== 9/9 Status ==="
-systemctl --no-pager --full status my-financing-api nginx cloudflared-tunnel || true
+if [ "$MANAGE_CLOUDFLARED" -eq 1 ] || systemctl list-unit-files cloudflared-tunnel.service >/dev/null 2>&1; then
+  systemctl --no-pager --full status my-financing-api nginx cloudflared-tunnel || true
+elif systemctl list-unit-files cloudflared.service >/dev/null 2>&1; then
+  systemctl --no-pager --full status my-financing-api nginx cloudflared || true
+else
+  systemctl --no-pager --full status my-financing-api nginx || true
+fi
 echo ""
 echo "Deployment finished."
 echo "Public URL: https://${DOMAIN}"

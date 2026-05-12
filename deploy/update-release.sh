@@ -128,18 +128,18 @@ if [ -z "$PYTHON_BIN" ] && run_as_app_user bash -lc "command -v conda >/dev/null
   rm -f /tmp/my-financing-python-path
 fi
 
-if [ -n "$PYTHON_BIN" ]; then
-  echo "Using conda env ${CONDA_ENV_NAME}: ${PYTHON_BIN}"
-  run_as_app_user "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt"
-else
-  echo "Conda env ${CONDA_ENV_NAME} not found; falling back to backend/.venv."
-  if [ ! -x "$APP_DIR/backend/.venv/bin/python" ]; then
-    run_as_app_user python3 -m venv "$APP_DIR/backend/.venv"
-  fi
-  run_as_app_user "$APP_DIR/backend/.venv/bin/pip" install --upgrade pip
-  run_as_app_user "$APP_DIR/backend/.venv/bin/pip" install -r "$APP_DIR/backend/requirements.txt"
-  UVICORN_BIN="$APP_DIR/backend/.venv/bin/uvicorn"
-  PYTHON_ENV_BIN="$APP_DIR/backend/.venv/bin"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "Conda env ${CONDA_ENV_NAME} is required but was not found." >&2
+  echo "Create it before running this script, for example: cd backend && conda env create -f environment.yml" >&2
+  exit 1
+fi
+echo "Using conda env ${CONDA_ENV_NAME}: ${PYTHON_BIN}"
+run_as_app_user "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt"
+
+if [ ! -x "$UVICORN_BIN" ]; then
+  echo "uvicorn was not found in ${CONDA_ENV_NAME}: ${UVICORN_BIN}" >&2
+  echo "Check backend/requirements.txt installation in the conda environment." >&2
+  exit 1
 fi
 
 echo "=== 3/8 Build frontend ==="
