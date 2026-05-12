@@ -94,7 +94,17 @@ if [ ! -d "$APP_DIR/backend" ] || [ ! -d "$APP_DIR/frontend" ]; then
 fi
 
 run_as_app_user() {
-  sudo -u "$APP_USER" "$@"
+  sudo -H -u "$APP_USER" "$@"
+}
+
+run_as_app_user_shell() {
+  local command="$1"
+  run_as_app_user bash -lc "$command"
+}
+
+run_as_app_user_node() {
+  local command="$1"
+  run_as_app_user_shell "if [ -s \"\$HOME/.nvm/nvm.sh\" ]; then export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; fi; ${command}"
 }
 
 echo "=== 1/8 Update source code ==="
@@ -120,7 +130,7 @@ for prefix in "/home/${APP_USER}/miniconda3" "/home/${APP_USER}/anaconda3" "/opt
   fi
 done
 
-if [ -z "$PYTHON_BIN" ] && run_as_app_user bash -lc "command -v conda >/dev/null 2>&1 && conda run -n ${CONDA_ENV_NAME} python -c 'import sys; print(sys.executable)'" >/tmp/my-financing-python-path 2>/dev/null; then
+if [ -z "$PYTHON_BIN" ] && run_as_app_user_shell "command -v conda >/dev/null 2>&1 && conda run -n ${CONDA_ENV_NAME} python -c 'import sys; print(sys.executable)'" >/tmp/my-financing-python-path 2>/dev/null; then
   PYTHON_BIN="$(cat /tmp/my-financing-python-path | tail -n 1)"
   PIP_BIN="$(dirname "$PYTHON_BIN")/pip"
   UVICORN_BIN="$(dirname "$PYTHON_BIN")/uvicorn"
@@ -143,13 +153,28 @@ if [ ! -x "$UVICORN_BIN" ]; then
 fi
 
 echo "=== 3/8 Build frontend ==="
-cd "$APP_DIR/frontend"
-if [ -f package-lock.json ]; then
-  run_as_app_user npm ci
-else
-  run_as_app_user npm install
+if ! run_as_app_user_node "command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1"; then
+  echo "Missing required Node.js tools for app user ${APP_USER}: node npm" >&2
+  echo "Install Node.js/npm for ${APP_USER}, or ensure ${APP_USER}'s nvm install is available at ~/.nvm/nvm.sh." >&2
+  exit 1
 fi
-run_as_app_user env VITE_API_BASE=/api npm run build
+NODE_VERSION="$(run_as_app_user_node "node -v" 2>/dev/null || true)"
+NODE_PATH="$(run_as_app_user_node "command -v node" 2>/dev/null || true)"
+NODE_MAJOR="$(printf '%s' "$NODE_VERSION" | sed -E 's/^v([0-9]+).*/\1/' || true)"
+if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 20 ]; then
+  echo "Node.js >= 20 is required for app user ${APP_USER}, found: ${NODE_VERSION:-missing}." >&2
+  echo "Please install or activate a suitable Node.js version for ${APP_USER} before running this script." >&2
+  exit 1
+fi
+echo "Using Node.js ${NODE_VERSION}: ${NODE_PATH}"
+
+printf -v FRONTEND_DIR_Q "%q" "$APP_DIR/frontend"
+if [ -f "$APP_DIR/frontend/package-lock.json" ]; then
+  run_as_app_user_node "cd ${FRONTEND_DIR_Q} && npm ci"
+else
+  run_as_app_user_node "cd ${FRONTEND_DIR_Q} && npm install"
+fi
+run_as_app_user_node "cd ${FRONTEND_DIR_Q} && VITE_API_BASE=/api npm run build"
 
 echo "=== 4/8 Verify Nginx configuration ==="
 if [ -f /etc/nginx/sites-available/my-financing ]; then
