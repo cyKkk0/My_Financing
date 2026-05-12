@@ -1,8 +1,8 @@
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -59,6 +59,7 @@ def calculate_portfolio_summary(db: Session) -> PortfolioSummaryOut:
             item["cost"] += fee or amount
             item["invested"] += fee or amount
 
+    pending_amounts = _pending_amounts_by_fund(db)
     holdings: list[HoldingOut] = []
     market_value = Decimal("0")
     confirmed_market_value = Decimal("0")
@@ -73,7 +74,9 @@ def calculate_portfolio_summary(db: Session) -> PortfolioSummaryOut:
     latest_nav_date = _latest_official_nav_date(db, active_fund_codes)
     confirmed_nav_cutoff_date = _confirmed_nav_cutoff_date(db, active_fund_codes, latest_nav_date)
 
-    for fund_code, item in lots.items():
+    for fund_code in sorted(set(lots) | set(pending_amounts)):
+        item = lots[fund_code]
+        unconfirmed_amount = pending_amounts.get(fund_code, Decimal("0"))
         if abs(item["shares"]) <= EPSILON:
             item["shares"] = Decimal("0")
         if abs(item["cost"]) <= EPSILON:
@@ -124,7 +127,7 @@ def calculate_portfolio_summary(db: Session) -> PortfolioSummaryOut:
         total_invested += item["invested"]
         realized_cash += item["realized_cash"]
 
-        if item["shares"] <= 0 and item["cost"] <= 0:
+        if item["shares"] <= 0 and item["cost"] <= 0 and unconfirmed_amount <= 0:
             continue
 
         fund = funds.get(fund_code)
@@ -151,6 +154,7 @@ def calculate_portfolio_summary(db: Session) -> PortfolioSummaryOut:
                 confirmed_cumulative_profit=_q2(confirmed_cumulative_profit),
                 confirmed_cumulative_profit_rate=_q4(confirmed_cumulative_profit_rate),
                 realized_cash=_q2(item["realized_cash"]),
+                unconfirmed_amount=_q2(unconfirmed_amount),
                 previous_nav=prev_nav,
                 daily_pnl=_q2(daily_pnl) if daily_pnl is not None else None,
             )
@@ -220,6 +224,10 @@ def calculate_snapshot_as_of(
         .where(
             models.Transaction.status == "confirmed",
             models.Transaction.trade_date <= as_of_date,
+            or_(
+                models.Transaction.confirmed_at.is_(None),
+                models.Transaction.confirmed_at <= datetime.combine(as_of_date, datetime.max.time()),
+            ),
         )
         .order_by(
             models.Transaction.trade_date,
@@ -357,6 +365,24 @@ def _nav_on_or_before(db: Session, fund_code: str, as_of_date: date) -> models.F
         .order_by(models.FundNav.nav_date.desc())
         .limit(1)
     )
+
+
+def _pending_amounts_by_fund(db: Session) -> dict[str, Decimal]:
+    pending_amounts: dict[str, Decimal] = defaultdict(Decimal)
+
+    pending_transactions = db.scalars(
+        select(models.Transaction).where(models.Transaction.status == "pending")
+    ).all()
+    for tx in pending_transactions:
+        pending_amounts[tx.fund_code] += Decimal(tx.amount or 0)
+
+    pending_executions = db.scalars(
+        select(models.DcaExecution).where(models.DcaExecution.status == "pending")
+    ).all()
+    for execution in pending_executions:
+        pending_amounts[execution.fund_code] += Decimal(execution.amount or 0)
+
+    return pending_amounts
 
 
 def _q2(value: Decimal) -> Decimal:

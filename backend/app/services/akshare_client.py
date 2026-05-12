@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
@@ -39,11 +39,26 @@ def refresh_trading_calendar() -> set[date]:
 
 def next_trading_day(d: date, trading_days: set[date]) -> date:
     """Return d if it is a trading day, else the next trading day."""
-    from datetime import timedelta
-
     while d not in trading_days:
         d += timedelta(days=1)
     return d
+
+
+def add_trading_days(d: date, days: int, trading_days: set[date] | None = None) -> date:
+    """Advance by N trading days, excluding the start date."""
+    if days <= 0:
+        return d
+    trading_days = trading_days or load_trading_calendar()
+    current = d
+    remaining = days
+    while remaining > 0:
+        current += timedelta(days=1)
+        if trading_days:
+            if current in trading_days:
+                remaining -= 1
+        elif current.weekday() < 5:
+            remaining -= 1
+    return current
 
 
 class AkshareFundClient:
@@ -69,6 +84,24 @@ class AkshareFundClient:
         if df.empty:
             return None
         return trade_confirm_days_from_frame(df, transaction_type)
+
+    def confirm_date_from_trade(
+        self,
+        fund_code: str,
+        transaction_type: str,
+        trade_date: date,
+    ) -> dict[str, Any]:
+        confirm_days = self.trade_confirm_days(fund_code, transaction_type)
+        if confirm_days is None:
+            confirm_days = 1
+            source = "fallback_trade_plus_1"
+        else:
+            source = "akshare_fund_fee_em"
+        return {
+            "confirm_date": add_trading_days(trade_date, confirm_days),
+            "confirm_days": confirm_days,
+            "source": source,
+        }
 
     def trade_date_from_confirm(
         self,

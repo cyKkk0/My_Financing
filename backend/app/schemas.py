@@ -125,6 +125,7 @@ class HoldingOut(BaseModel):
     confirmed_cumulative_profit: Decimal
     confirmed_cumulative_profit_rate: Decimal
     realized_cash: Decimal
+    unconfirmed_amount: Decimal = Decimal("0")
     previous_nav: Decimal | None = None
     daily_pnl: Decimal | None = None
 

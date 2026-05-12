@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -32,6 +32,15 @@ class FundNav(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     fund: Mapped[Fund] = relationship(back_populates="navs")
+
+
+class TradingCalendarDay(Base):
+    __tablename__ = "trading_calendar"
+
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    is_trading_day: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(32), default="akshare")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Transaction(Base):

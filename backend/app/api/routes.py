@@ -3,7 +3,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -26,12 +26,12 @@ from app.schemas import (
 from app.services.ai_advisor import generate_advice, stream_chat_advice
 from app.services.akshare_client import (
     AkshareFundClient,
+    add_trading_days,
     load_trading_calendar,
-    refresh_trading_calendar,
-    trading_calendar_coverage_end,
 )
 from app.services.alipay_pdf import ParsedAlipayTransaction, apply_resolved_trade_date, parse_alipay_pdf, parse_alipay_pdf_bytes
 from app.services.portfolio import calculate_portfolio_summary, save_snapshot
+from app.services.trading_calendar import ensure_trading_calendar_coverage
 
 router = APIRouter()
 
@@ -56,27 +56,39 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
     resolved_nav_date = trade_date
     resolved_nav_source = "manual"
     status = "confirmed"
+    confirm_date: date | None = None
+    if payload.transaction_type in ("buy", "sell"):
+        try:
+            confirm_info = AkshareFundClient().confirm_date_from_trade(
+                payload.fund_code,
+                payload.transaction_type,
+                trade_date,
+            )
+            confirm_date = confirm_info["confirm_date"]
+        except Exception:
+            confirm_date = add_trading_days(trade_date, 1)
+
     if resolved_nav is None:
-        nav_info = _resolve_nav(payload.fund_code, trade_date, db)
+        nav_info = _resolve_nav_exact(payload.fund_code, trade_date, db)
         if nav_info is not None:
             resolved_nav = Decimal(nav_info["unit_nav"])
             resolved_nav_date = nav_info["nav_date"]
             resolved_nav_source = str(nav_info["source"])
-        # If the resolved NAV date is before trade_date, the exact trade_date NAV
-        # is not yet available. For user-initiated buy/sell orders, mark as pending
-        # so a daily job can confirm it once the NAV is published.
-        if payload.transaction_type in ("buy", "sell"):
-            if resolved_nav is None or resolved_nav_date < trade_date:
-                if payload.initiated_at is not None:
-                    status = "pending"
+    if payload.transaction_type in ("buy", "sell"):
+        if resolved_nav is None or confirm_date is None or date.today() < confirm_date:
+            status = "pending"
+
+    effective_nav = resolved_nav if status == "confirmed" else None
 
     amount, shares = _resolve_transaction_numbers(
         payload.transaction_type,
         payload.amount,
         payload.shares,
-        resolved_nav,
+        effective_nav,
         payload.fee,
     )
+    if status == "pending" and payload.transaction_type == "buy":
+        shares = Decimal("0")
     fund = db.get(models.Fund, payload.fund_code)
     if fund is None:
         fund = models.Fund(code=payload.fund_code, name=fund_name or payload.fund_code)
@@ -90,14 +102,17 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
         transaction_type=payload.transaction_type,
         amount=amount,
         shares=shares,
-        nav=resolved_nav,
+        nav=effective_nav,
         fee=payload.fee,
         note=payload.note,
         initiated_at=initiated_at,
+        confirmed_at=datetime.combine(confirm_date, datetime.min.time())
+        if status == "confirmed" and confirm_date is not None
+        else None,
         status=status,
     )
     db.add(tx)
-    if resolved_nav is not None:
+    if effective_nav is not None:
         nav = db.scalar(
             select(models.FundNav).where(
                 models.FundNav.fund_code == payload.fund_code,
@@ -111,7 +126,7 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
                 source=resolved_nav_source,
             )
             db.add(nav)
-        nav.unit_nav = resolved_nav
+        nav.unit_nav = effective_nav
     db.commit()
     db.refresh(tx)
     return tx
@@ -147,18 +162,18 @@ def list_transactions_page(
 ) -> dict[str, object]:
     page = max(page, 1)
     page_size = min(max(page_size, 1), 50)
-    base_query = _transaction_query(fund_code, transaction_type, start_date, end_date)
-    total = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
-    transactions = list(
-        db.scalars(
-            base_query
-            .order_by(models.Transaction.trade_date.desc(), models.Transaction.id.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-        ).all()
+    items = _combined_transaction_items(
+        db,
+        fund_code=fund_code,
+        transaction_type=transaction_type,
+        start_date=start_date,
+        end_date=end_date,
     )
+    total = len(items)
+    start = (page - 1) * page_size
+    end = start + page_size
     return {
-        "items": _serialize_transactions(db, transactions),
+        "items": items[start:end],
         "page": page,
         "page_size": page_size,
         "total": total,
@@ -194,6 +209,7 @@ def _serialize_transactions(db: Session, transactions: list[models.Transaction])
     return [
         {
             "id": tx.id,
+            "sort_id": tx.id,
             "fund_code": tx.fund_code,
             "fund_name": fund_names.get(tx.fund_code, tx.fund_code),
             "trade_date": tx.trade_date.isoformat() if tx.trade_date else None,
@@ -206,9 +222,101 @@ def _serialize_transactions(db: Session, transactions: list[models.Transaction])
             "initiated_at": tx.initiated_at.isoformat() if tx.initiated_at else None,
             "confirmed_at": tx.confirmed_at.isoformat() if tx.confirmed_at else None,
             "status": tx.status,
+            "external_id": tx.external_id,
+            "import_source": tx.import_source,
+            "source_label": _transaction_source_label(tx),
+            "is_virtual": False,
         }
         for tx in transactions
     ]
+
+
+def _combined_transaction_items(
+    db: Session,
+    fund_code: str | None = None,
+    transaction_type: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> list[dict[str, object]]:
+    transactions = list(
+        db.scalars(
+            _transaction_query(fund_code, transaction_type, start_date, end_date)
+        ).all()
+    )
+    items = _serialize_transactions(db, transactions)
+
+    if transaction_type and transaction_type != "buy":
+        executions = []
+    else:
+        execution_query = select(models.DcaExecution).where(models.DcaExecution.transaction_id.is_(None))
+        if fund_code:
+            execution_query = execution_query.where(models.DcaExecution.fund_code == fund_code.zfill(6))
+        if start_date:
+            execution_query = execution_query.where(models.DcaExecution.scheduled_date >= start_date)
+        if end_date:
+            execution_query = execution_query.where(models.DcaExecution.scheduled_date <= end_date)
+        executions = list(db.scalars(execution_query).all())
+
+    if executions:
+        fund_codes = {execution.fund_code for execution in executions}
+        plan_ids = {execution.plan_id for execution in executions}
+        fund_names = {
+            fund.code: fund.name
+            for fund in db.scalars(select(models.Fund).where(models.Fund.code.in_(fund_codes))).all()
+        }
+        fees = {
+            plan.id: plan.fee
+            for plan in db.scalars(select(models.DcaPlan).where(models.DcaPlan.id.in_(plan_ids))).all()
+        }
+        items.extend(
+            _serialize_dca_execution(execution, fund_names, fees)
+            for execution in executions
+        )
+
+    return sorted(
+        items,
+        key=lambda item: (
+            str(item.get("trade_date") or ""),
+            1 if item.get("is_virtual") else 0,
+            int(item.get("sort_id") or 0),
+        ),
+        reverse=True,
+    )
+
+
+def _serialize_dca_execution(
+    execution: models.DcaExecution,
+    fund_names: dict[str, str],
+    fees: dict[int, Decimal],
+) -> dict[str, object]:
+    return {
+        "id": f"dca-execution-{execution.id}",
+        "sort_id": execution.id,
+        "fund_code": execution.fund_code,
+        "fund_name": fund_names.get(execution.fund_code, execution.fund_code),
+        "trade_date": execution.scheduled_date.isoformat(),
+        "transaction_type": "buy",
+        "amount": execution.amount,
+        "shares": execution.shares or Decimal("0"),
+        "nav": execution.nav,
+        "fee": fees.get(execution.plan_id, Decimal("0")),
+        "note": execution.note,
+        "initiated_at": None,
+        "confirmed_at": execution.confirmed_date.isoformat() if execution.confirmed_date else None,
+        "status": execution.status,
+        "external_id": f"dca:execution-{execution.id}",
+        "import_source": "dca_execution",
+        "source_label": "定投执行",
+        "is_virtual": True,
+    }
+
+
+def _transaction_source_label(tx: models.Transaction) -> str | None:
+    if tx.external_id and tx.external_id.startswith("dca:"):
+        return "定投确认"
+    if tx.import_source == "alipay_pdf":
+        return "支付宝"
+    return None
 
 
 @router.delete("/transactions/{transaction_id}")
@@ -456,9 +564,9 @@ def list_dca_executions(db: Session = Depends(get_db)) -> list[models.DcaExecuti
 
 @router.get("/funds/{fund_code}/nav")
 def get_fund_nav(fund_code: str, trade_date: date, db: Session = Depends(get_db)) -> dict[str, str]:
-    nav = _resolve_nav(fund_code, trade_date, db)
+    nav = _resolve_nav_exact(fund_code, trade_date, db)
     if nav is None:
-        raise HTTPException(status_code=404, detail="No NAV found for this fund and date")
+        raise HTTPException(status_code=404, detail="No NAV found for this fund on this exact date")
     return {
         "fund_code": fund_code.zfill(6),
         "nav_date": nav["nav_date"].isoformat(),
@@ -634,18 +742,12 @@ def confirm_pending(
 
 @router.post("/jobs/refresh-trading-calendar")
 def refresh_calendar(
+    db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
     x_admin_token: str | None = Header(default=None),
 ) -> dict[str, object]:
     _require_admin_token(settings, x_admin_token)
-    old_end = trading_calendar_coverage_end()
-    new_cal = refresh_trading_calendar()
-    new_end = trading_calendar_coverage_end()
-    return {
-        "previous_coverage_end": old_end.isoformat() if old_end else None,
-        "new_coverage_end": new_end.isoformat() if new_end else None,
-        "total_trading_days": len(new_cal),
-    }
+    return ensure_trading_calendar_coverage(db, force=True)
 
 
 @router.post("/funds/refresh-names")

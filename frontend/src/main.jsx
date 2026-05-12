@@ -18,7 +18,6 @@ import {
   importAlipayPdf,
   listDcaExecutions,
   listDcaPlans,
-  listTransactions,
   listTransactionsPage,
   runDailyUpdate,
   streamAdviceChat,
@@ -57,14 +56,14 @@ function App() {
       const [summaryData, snapshotData, transactionData, dcaPlanData, dcaExecutionData, adviceData] = await Promise.all([
         getPortfolioSummary(),
         getSnapshots(snapshotPeriod),
-        listTransactions({ limit: 5 }),
+        listTransactionsPage({ page: 1, pageSize: 5 }),
         listDcaPlans(),
         listDcaExecutions(),
         getLatestAdvice(),
       ]);
       setSummary(summaryData || emptySummary);
       setSnapshots(snapshotData || []);
-      setRecentTransactions(transactionData || []);
+      setRecentTransactions(transactionData?.items || []);
       setDcaPlans(dcaPlanData || []);
       setDcaExecutions(dcaExecutionData || []);
       setAdvice(adviceData);
@@ -705,9 +704,9 @@ function HoldingsTable({ holdings }) {
               </td>
               <td>{number(item.shares)}</td>
               <td><strong>{item.latest_nav || "-"}</strong></td>
-              <td class="market-value-cell">
+              <td className="market-value-cell">
                 <strong>{money(item.market_value)}</strong>
-                <small>未确认 {money(Number(item.market_value) - Number(item.confirmed_market_value || 0))}</small>
+                <small>未确认 {money(item.unconfirmed_amount || 0)}</small>
               </td>
               <td className={Number(item.daily_pnl ?? 0) >= 0 ? "gain" : "loss"}>
                 <strong>{item.daily_pnl != null ? money(item.daily_pnl) : "-"}</strong>
@@ -761,7 +760,7 @@ function TransactionForm({ onCreated }) {
     if (!shouldFetch) return undefined;
 
     let cancelled = false;
-    setNavStatus("正在获取确认净值...");
+    setNavStatus("正在获取交易日净值...");
     const timer = window.setTimeout(async () => {
       try {
         const nav = await getFundNav(fundCode, form.trade_date);
@@ -773,7 +772,7 @@ function TransactionForm({ onCreated }) {
         setNavStatus(`已使用 ${nav.nav_date} 的单位净值 ${nav.unit_nav}`);
       } catch {
         if (!cancelled) {
-          setNavStatus("未找到该日期净值，可手动填写净值后计算。");
+          setNavStatus("未找到交易日净值，保存后将标记为待确认。");
         }
       }
     }, 350);
@@ -983,6 +982,7 @@ function RecentTransactionList({ transactions, loading, onOpenHistory }) {
               <strong>{item.fund_name || item.fund_code}</strong>
               <span>
                 {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
+                {item.source_label && <span className="pending-badge">{item.source_label}</span>}
                 {item.status === "pending" && <span className="pending-badge">待确认</span>}
               </span>
               {(item.initiated_at || item.confirmed_at) && (
@@ -1160,6 +1160,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
                 <strong>{item.fund_name || item.fund_code}</strong>
                 <span>
                   {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
+                  {item.source_label && <span className="pending-badge">{item.source_label}</span>}
                   {item.status === "pending" && <span className="pending-badge">待确认</span>}
                 </span>
                 <span>份额 {number(item.shares)} · 净值 {item.nav || "-"} · 手续费 {money(item.fee)}</span>
@@ -1169,14 +1170,16 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
               </div>
               <div className="transaction-actions">
                 <b>{money(item.amount)}</b>
-                <button
-                  className="danger-button"
-                  type="button"
-                  disabled={deletingId === item.id}
-                  onClick={() => removeTransaction(item.id)}
-                >
-                  {deletingId === item.id ? "撤销中" : "撤销"}
-                </button>
+                {!item.is_virtual && (
+                  <button
+                    className="danger-button"
+                    type="button"
+                    disabled={deletingId === item.id}
+                    onClick={() => removeTransaction(item.id)}
+                  >
+                    {deletingId === item.id ? "撤销中" : "撤销"}
+                  </button>
+                )}
               </div>
             </div>
           ))}
