@@ -1131,8 +1131,12 @@ function RecentTransactionList({ transactions, loading, onOpenHistory }) {
               <strong>{item.fund_name || item.fund_code}</strong>
               <span>
                 {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
-                {item.source_label && <span className="pending-badge">{item.source_label}</span>}
-                {item.status === "pending" && <span className="pending-badge">待确认</span>}
+                {(item.source_label || item.status === "pending") && (
+                  <span className="tag-group">
+                    {item.source_label && <span className={tagClass(item.source_label)}>{item.source_label}</span>}
+                    {item.status === "pending" && <span className="tag tag-pending">待确认</span>}
+                  </span>
+                )}
               </span>
               {(item.initiated_at || item.confirmed_at) && (
                 <span style={{fontSize: "0.8em", color: "#888"}}>发起 {timeStr(item.initiated_at)} · 确认 {timeStr(item.confirmed_at)}</span>
@@ -1321,8 +1325,12 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
                 <strong>{item.fund_name || item.fund_code}</strong>
                 <span>
                   {item.fund_code} · {item.trade_date} · {typeName(item.transaction_type)}
-                  {item.source_label && <span className="pending-badge">{item.source_label}</span>}
-                  {item.status === "pending" && <span className="pending-badge">待确认</span>}
+                  {(item.source_label || item.status === "pending") && (
+                    <span className="tag-group">
+                      {item.source_label && <span className={tagClass(item.source_label)}>{item.source_label}</span>}
+                      {item.status === "pending" && <span className="tag tag-pending">待确认</span>}
+                    </span>
+                  )}
                 </span>
                 <span>份额 {number(item.shares)} · 净值 {item.nav || "-"} · 手续费 {money(item.fee)}</span>
                 {(item.initiated_at || item.confirmed_at) && (
@@ -1735,6 +1743,10 @@ function number(value) {
 
 function typeName(type) {
   return { buy: "买入", sell: "卖出", dividend: "分红", fee: "费用" }[type] || type;
+}
+
+function tagClass(label) {
+  return { "定投执行": "tag tag-dca-exec", "定投确认": "tag tag-dca-confirm", "支付宝": "tag tag-alipay" }[label] || "tag";
 }
 
 function frequencyName(frequency) {

@@ -577,17 +577,54 @@ select {
   gap: 8px;
 }
 
-.pending-badge {
-  display: inline-block;
+.transaction-item .tag-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   margin-left: 6px;
-  padding: 1px 6px;
-  border: 1px solid #fcd34d;
-  border-radius: 4px;
+  margin-top: 0;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.transaction-item .tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: max-content;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  margin-top: 0;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.tag-dca-exec {
+  background: #f3e8ff;
+  color: #6b21a8;
+  border: 1px solid #d8b4fe;
+}
+
+.tag-dca-confirm {
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #86efac;
+}
+
+.tag-alipay {
+  background: #dbeafe;
+  color: #1e40af;
+  border: 1px solid #93c5fd;
+}
+
+.tag-pending {
   background: #fef3c7;
   color: #92400e;
-  font-size: 11px;
-  font-weight: 700;
-  vertical-align: middle;
+  border: 1px solid #fcd34d;
 }
 
 .transaction-actions {
