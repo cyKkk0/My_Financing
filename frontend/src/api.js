@@ -1,5 +1,27 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+async function responseError(response) {
+  const text = await response.text();
+  let message = text;
+  if (text) {
+    try {
+      const payload = JSON.parse(text);
+      message = payload.detail || payload.message || text;
+    } catch {
+      message = text;
+    }
+  }
+  return new ApiError(message || `Request failed: ${response.status}`, response.status);
+}
+
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -10,12 +32,39 @@ async function request(path, options = {}) {
   });
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `Request failed: ${response.status}`);
+    throw await responseError(response);
   }
 
   if (response.status === 204) return null;
   return response.json();
+}
+
+function authHeaders(adminToken) {
+  return adminToken
+    ? {
+        Authorization: `Bearer ${adminToken}`,
+      }
+    : {};
+}
+
+export function loginAdmin(payload) {
+  return request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getAdminMe(adminToken) {
+  return request("/auth/me", {
+    headers: authHeaders(adminToken),
+  });
+}
+
+export function logoutAdmin(adminToken) {
+  return request("/auth/logout", {
+    method: "POST",
+    headers: authHeaders(adminToken),
+  });
 }
 
 export function getPortfolioSummary() {
@@ -68,80 +117,91 @@ export function getFundPerformance(fundCode, range = "month") {
   return request(`/funds/${fundCode}/performance?range=${range}`);
 }
 
-export function createTransaction(payload) {
+export function createTransaction(payload, adminToken) {
   return request("/transactions", {
     method: "POST",
+    headers: authHeaders(adminToken),
     body: JSON.stringify(payload),
   });
 }
 
-export function deleteTransaction(transactionId) {
+export function deleteTransaction(transactionId, adminToken) {
   return request(`/transactions/${transactionId}`, {
     method: "DELETE",
+    headers: authHeaders(adminToken),
   });
 }
 
-export function deleteTransactionsBatch({ fundCode, startDate, endDate }) {
+export function deleteTransactionsBatch({ fundCode, startDate, endDate }, adminToken) {
   const params = new URLSearchParams();
   if (fundCode) params.set("fund_code", fundCode);
   if (startDate) params.set("start_date", startDate);
   if (endDate) params.set("end_date", endDate);
   return request(`/transactions?${params.toString()}`, {
     method: "DELETE",
+    headers: authHeaders(adminToken),
   });
 }
 
-export async function importAlipayPdf(file, dryRun = true) {
+export async function importAlipayPdf(file, dryRun = true, adminToken) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("dry_run", dryRun);
 
   const response = await fetch(`${API_BASE}/transactions/import/alipay-pdf`, {
     method: "POST",
+    headers: authHeaders(adminToken),
     body: formData,
   });
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `Request failed: ${response.status}`);
+    throw await responseError(response);
   }
 
   return response.json();
 }
 
-export function createDcaPlan(payload) {
+export function createDcaPlan(payload, adminToken) {
   return request("/dca-plans", {
     method: "POST",
+    headers: authHeaders(adminToken),
     body: JSON.stringify(payload),
   });
 }
 
-export function updateDcaPlan(planId, payload) {
+export function updateDcaPlan(planId, payload, adminToken) {
   return request(`/dca-plans/${planId}`, {
     method: "PUT",
+    headers: authHeaders(adminToken),
     body: JSON.stringify(payload),
   });
 }
 
-export function deleteDcaPlan(planId) {
-  return request(`/dca-plans/${planId}`, { method: "DELETE" });
+export function deleteDcaPlan(planId, adminToken) {
+  return request(`/dca-plans/${planId}`, {
+    method: "DELETE",
+    headers: authHeaders(adminToken),
+  });
+}
+
+export function deleteDcaExecution(executionId, adminToken) {
+  return request(`/dca-executions/${executionId}`, {
+    method: "DELETE",
+    headers: authHeaders(adminToken),
+  });
 }
 
 export function confirmPendingTransactions(adminToken) {
   return request("/jobs/confirm-pending-transactions", {
     method: "POST",
-    headers: {
-      "X-Admin-Token": adminToken,
-    },
+    headers: authHeaders(adminToken),
   });
 }
 
 export function runDailyUpdate(adminToken) {
   return request("/jobs/daily-update", {
     method: "POST",
-    headers: {
-      "X-Admin-Token": adminToken,
-    },
+    headers: authHeaders(adminToken),
   });
 }
 
@@ -150,14 +210,13 @@ export async function streamAdviceChat(messages, adminToken, onChunk) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Admin-Token": adminToken,
+      ...authHeaders(adminToken),
     },
     body: JSON.stringify({ messages }),
   });
 
   if (!response.ok || !response.body) {
-    const detail = await response.text();
-    throw new Error(detail || `Request failed: ${response.status}`);
+    throw await responseError(response);
   }
 
   const reader = response.body.getReader();

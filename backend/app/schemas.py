@@ -170,3 +170,20 @@ class FundPerformancePoint(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=20)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class LoginResponse(BaseModel):
+    token: str
+    token_type: str = "bearer"
+    username: str
+    expires_at: datetime
+
+
+class AdminMeOut(BaseModel):
+    username: str
+    expires_at: datetime | None = None

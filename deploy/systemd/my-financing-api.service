@@ -8,7 +8,6 @@ User=cykkk
 WorkingDirectory=/home/cykkk/github_proj/My_Financing/backend
 ExecStart=/home/cykkk/miniconda3/envs/my-financing/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 Environment=PYTHONUNBUFFERED=1
-Environment=FRONTEND_ORIGINS=http://localhost:5173,http://10.29.223.27:5173,http://127.0.0.1:5173
 
 [Install]
 WantedBy=multi-user.target

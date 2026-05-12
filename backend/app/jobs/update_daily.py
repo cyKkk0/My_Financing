@@ -20,25 +20,34 @@ def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
     client = AkshareFundClient()
     fund_codes = _fund_codes_to_update(db)
     fund_names = client.fund_name_map()
+    history_cache: dict[str, list[dict]] = {}
+    confirm_days_cache: dict[tuple[str, str], tuple[int, str]] = {}
     updated = 0
     skipped: list[str] = []
     updated_details: list[str] = []
 
     for fund_code in fund_codes:
-        latest = client.latest_nav_for(fund_code)
-        if latest is None:
-            skipped.append(fund_code)
-            continue
+        nav_rows = _recent_navs_from_history(
+            fund_code,
+            _history_navs_cached(client, history_cache, fund_code),
+            limit=3,
+        )
+        if not nav_rows:
+            latest = client.latest_nav_for(fund_code)
+            if latest is None:
+                skipped.append(fund_code)
+                continue
+            nav_rows = [latest]
+        latest = nav_rows[0]
 
         fund = db.get(models.Fund, fund_code)
-        resolved_name = fund_names.get(fund_code.zfill(6)) or latest.get("name")
+        resolved_name = fund_names.get(fund_code.zfill(6))
         if fund is None:
             fund = models.Fund(code=fund_code, name=resolved_name or fund_code)
             db.add(fund)
         elif resolved_name and (fund.name == fund.code or fund.name == fund_code):
             fund.name = resolved_name
 
-        nav_rows = client.recent_navs_for(fund_code, limit=3) or [latest]
         for nav_info in nav_rows:
             _upsert_nav(db, fund_code, nav_info)
         updated += 1
@@ -47,8 +56,8 @@ def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
         )
 
     db.commit()
-    pending_result = confirm_pending_transactions(db, client)
-    dca_confirmed = confirm_pending_dca_executions(db, client, date.today())
+    pending_result = confirm_pending_transactions(db, client, history_cache, confirm_days_cache)
+    dca_confirmed = confirm_pending_dca_executions(db, client, date.today(), history_cache, confirm_days_cache)
     db.commit()
     backfilled = backfill_snapshots(db)
     snapshot = save_snapshot(db, date.today())
@@ -98,8 +107,17 @@ def process_due_dca_plans(
     client: AkshareFundClient | None = None,
     target_date: date | None = None,
 ) -> dict[str, int]:
+    client = client or AkshareFundClient()
+    history_cache: dict[str, list[dict]] = {}
+    confirm_days_cache: dict[tuple[str, str], tuple[int, str]] = {}
     result = create_due_dca_executions(db, target_date or date.today())
-    confirmed = confirm_pending_dca_executions(db, client or AkshareFundClient(), target_date or date.today())
+    confirmed = confirm_pending_dca_executions(
+        db,
+        client,
+        target_date or date.today(),
+        history_cache,
+        confirm_days_cache,
+    )
     return {"created": result["created"], "confirmed": confirmed, "pending": _pending_dca_execution_count(db)}
 
 
@@ -140,7 +158,13 @@ def create_due_dca_executions(db: Session, target_date: date | None = None) -> d
     return {"created": created, "pending": _pending_dca_execution_count(db)}
 
 
-def confirm_pending_dca_executions(db: Session, client: AkshareFundClient, target_date: date) -> int:
+def confirm_pending_dca_executions(
+    db: Session,
+    client: AkshareFundClient,
+    target_date: date,
+    history_cache: dict[str, list[dict]] | None = None,
+    confirm_days_cache: dict[tuple[str, str], tuple[int, str]] | None = None,
+) -> int:
     """Confirm pending DCA executions whose trade-date NAV is now available.
 
     For each pending execution:
@@ -170,7 +194,7 @@ def confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targe
 
             trade_date = next_trading_day(db, execution.scheduled_date)
 
-            confirm_info = _confirm_info(db, client, fund, "buy", trade_date)
+            confirm_info = _confirm_info(db, client, fund, "buy", trade_date, confirm_days_cache)
             confirm_date = confirm_info["confirm_date"]
             if target_date < confirm_date:
                 execution.note = f"预计 {confirm_date.isoformat()} 确认份额"
@@ -190,7 +214,7 @@ def confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targe
                     nav_cache[fund][s.nav_date] = Decimal(s.unit_nav)
                 # Supplement with AKShare history
                 try:
-                    for row in client.history_navs(fund):
+                    for row in _history_navs_cached(client, history_cache, fund):
                         d = row["nav_date"]
                         if d >= trade_date and d not in nav_cache[fund]:
                             nav_cache[fund][d] = row["unit_nav"]
@@ -258,7 +282,12 @@ def confirm_pending_dca_executions(db: Session, client: AkshareFundClient, targe
     return confirmed
 
 
-def confirm_pending_transactions(db: Session, client: AkshareFundClient | None = None) -> dict[str, int]:
+def confirm_pending_transactions(
+    db: Session,
+    client: AkshareFundClient | None = None,
+    history_cache: dict[str, list[dict]] | None = None,
+    confirm_days_cache: dict[tuple[str, str], tuple[int, str]] | None = None,
+) -> dict[str, int]:
     """Confirm pending manual transactions whose trade_date NAV is now available.
 
     Unlike DCA executions, manual pending transactions already have the trade_date
@@ -277,7 +306,7 @@ def confirm_pending_transactions(db: Session, client: AkshareFundClient | None =
     confirmed = 0
     for tx in pending:
         try:
-            confirm_info = _confirm_info(db, client, tx.fund_code, tx.transaction_type, tx.trade_date)
+            confirm_info = _confirm_info(db, client, tx.fund_code, tx.transaction_type, tx.trade_date, confirm_days_cache)
             confirm_date = confirm_info["confirm_date"]
             if date.today() < confirm_date:
                 continue
@@ -298,7 +327,7 @@ def confirm_pending_transactions(db: Session, client: AkshareFundClient | None =
             else:
                 history = {
                     row["nav_date"]: row["unit_nav"]
-                    for row in client.history_navs(tx.fund_code)
+                    for row in _history_navs_cached(client, history_cache, tx.fund_code)
                 }
                 unit_nav = history.get(tx.trade_date)
 
@@ -353,20 +382,29 @@ def _confirm_info(
     fund_code: str,
     transaction_type: str,
     trade_date: date,
+    confirm_days_cache: dict[tuple[str, str], tuple[int, str]] | None = None,
 ) -> dict[str, date | int | str]:
+    key = (fund_code.zfill(6), transaction_type)
     try:
-        confirm_days = client.trade_confirm_days(fund_code, transaction_type)
-        if confirm_days is None:
-            confirm_days = 1
-            source = "fallback_trade_plus_1"
+        if confirm_days_cache is not None and key in confirm_days_cache:
+            confirm_days, source = confirm_days_cache[key]
         else:
-            source = "akshare_fund_fee_em"
+            confirm_days = client.trade_confirm_days(fund_code, transaction_type)
+            if confirm_days is None:
+                confirm_days = 1
+                source = "fallback_trade_plus_1"
+            else:
+                source = "akshare_fund_fee_em"
+            if confirm_days_cache is not None:
+                confirm_days_cache[key] = (confirm_days, source)
         return {
             "confirm_date": add_trading_days(db, trade_date, confirm_days),
             "confirm_days": confirm_days,
             "source": source,
         }
     except Exception:
+        if confirm_days_cache is not None:
+            confirm_days_cache[key] = (1, "fallback_trade_plus_1")
         return {
             "confirm_date": _add_weekdays(trade_date, 1),
             "confirm_days": 1,
@@ -388,6 +426,41 @@ def _fund_codes_to_update(db: Session) -> list[str]:
     transaction_codes = {code for (code,) in db.execute(select(models.Transaction.fund_code).distinct()).all()}
     dca_codes = {code for (code,) in db.execute(select(models.DcaPlan.fund_code).distinct()).all()}
     return sorted(transaction_codes | dca_codes)
+
+
+def _history_navs_cached(
+    client: AkshareFundClient,
+    history_cache: dict[str, list[dict]] | None,
+    fund_code: str,
+) -> list[dict]:
+    if history_cache is None:
+        try:
+            return client.history_navs(fund_code)
+        except Exception:
+            return []
+
+    code = fund_code.zfill(6)
+    if code not in history_cache:
+        try:
+            history_cache[code] = client.history_navs(code)
+        except Exception:
+            history_cache[code] = []
+    return history_cache[code]
+
+
+def _recent_navs_from_history(fund_code: str, rows: list[dict], limit: int) -> list[dict]:
+    sorted_rows = sorted(rows, key=lambda item: item["nav_date"], reverse=True)
+    return [
+        {
+            "nav_date": row["nav_date"],
+            "unit_nav": row["unit_nav"],
+            "accumulated_nav": row.get("accumulated_nav"),
+            "daily_growth_rate": row.get("daily_growth_rate"),
+            "name": fund_code,
+            "source": "akshare_history",
+        }
+        for row in sorted_rows[:limit]
+    ]
 
 
 def _pending_dca_execution_count(db: Session) -> int:

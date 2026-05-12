@@ -77,7 +77,7 @@ VITE_API_BASE=/api npm run dev -- --host 127.0.0.1 --port 5173
 ```bash
 DATABASE_URL=sqlite:///./finance.sqlite3
 FRONTEND_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,https://myfinancing.asia
-ADMIN_TOKEN=change-me
+ADMIN_SESSION_HOURS=12
 LLM_API_BASE=https://api.openai.com/v1
 LLM_API_KEY=
 LLM_MODEL=gpt-4o-mini
@@ -121,7 +121,7 @@ http://127.0.0.1:80  # Nginx: frontend/dist + /api -> FastAPI:8000
 
 服务器需预先准备这些环境，部署脚本只会验证并使用它们，不会自动安装系统包、Node.js、cloudflared 或 conda 环境：
 
-- Nginx、curl、openssl。
+- Nginx、curl。
 - Node.js >= 20 和 npm。
 - cloudflared，并已能在命令行中执行。
 - conda 环境 `my-financing`，可通过 `cd backend && conda env create -f environment.yml` 创建。
@@ -157,8 +157,8 @@ sudo deploy/deploy-cloudflare.sh \
 
 脚本会自动完成：
 
-- 验证系统环境：Nginx、curl、openssl、Node.js、npm、cloudflared、conda 环境。
-- 写入 `backend/.env`：包含 `ADMIN_TOKEN`、`FRONTEND_ORIGINS` 等基础配置。
+- 验证系统环境：Nginx、curl、Node.js、npm、cloudflared、conda 环境。
+- 写入 `backend/.env`：包含 `FRONTEND_ORIGINS`、`ADMIN_SESSION_HOURS` 等基础配置。
 - 安装后端依赖：使用 conda 环境 `my-financing` 安装 `backend/requirements.txt`。
 - 构建前端：以 `VITE_API_BASE=/api` 生成 `frontend/dist`。
 - 配置 Nginx：静态托管前端，并将 `/api/` 反代到 `127.0.0.1:8000`。
@@ -250,14 +250,14 @@ sudo deploy/update-release.sh \
 ```bash
 sudo deploy/install-scheduled-tasks.sh \
   --user cykkk \
-  --api-base http://127.0.0.1:8000
+  --conda-env my-financing
 ```
 
 安装的任务：
 
 ```text
-0 21 * * * POST /api/jobs/daily-update
-30 9 * * * POST /api/jobs/dca-check
+0 21 * * * python -m app.jobs.runner daily-update
+30 9 * * * python -m app.jobs.runner dca-check
 ```
 
 任务职责：
@@ -265,7 +265,7 @@ sudo deploy/install-scheduled-tasks.sh \
 - 每天北京时间 21:00：更新基金净值，按 T+N 规则确认所有待确认交易，确认待确认定投执行，生成快照并更新收益；如果数据库里的交易日历距离当天不足 15 天，则补充未来 3 个月交易日历。
 - 每天北京时间 9:30：依据定投计划创建当天定投执行记录，不做确认。
 
-脚本会优先读取环境变量 `ADMIN_TOKEN`，否则读取 `backend/.env`。移除任务：
+移除任务：
 
 ```bash
 sudo deploy/install-scheduled-tasks.sh --user cykkk --uninstall
@@ -301,16 +301,17 @@ http://127.0.0.1:80
 ## 初始使用流程
 
 1. 启动或部署前后端。
-2. 在网页里录入基金交易或定投计划。
-3. 手动调用 `/api/jobs/daily-update` 可立即更新净值、确认交易并生成快照。
-4. 可调用 `/api/advice/daily` 生成 AI 建议。
-5. 在网页的「AI 实时对话」里输入后端 `ADMIN_TOKEN`，即可围绕当前组合继续追问。
-6. 后续交给 cron 自动执行每日任务。
+2. 默认访客模式只能刷新和查看数据。
+3. 使用默认管理员 `cykkk` 登录管理模式后，可录入基金交易、定投计划和执行更新任务。
+4. 在网页管理模式点击「更新净值」可立即更新净值、确认交易并生成快照。
+5. 可调用 `/api/advice/daily` 生成 AI 建议。
+6. 在网页的「AI 实时对话」里进入管理模式，即可围绕当前组合继续追问。
+7. 后续交给 cron 自动执行每日任务。
 
 网页顶部有两个不同动作：
 
 - `刷新`：重新读取数据库里的持仓、快照、交易和 AI 报告。
-- `更新净值`：使用 `ADMIN_TOKEN` 调用后端任务，从 AKShare 拉取最新净值、确认交易并生成当天快照。
+- `更新净值`：管理模式下调用后端任务，从 AKShare 拉取最新净值、确认交易并生成当天快照。
 
 ## AI 对话如何保护 Key
 
@@ -328,7 +329,7 @@ FastAPI 后端
 OpenAI-compatible 大模型 API
 ```
 
-前端只保存你手动输入的 `ADMIN_TOKEN`，用于证明这是你本人在使用；真正的大模型 API Key 只放在后端环境变量中。
+前端只在当前浏览器会话中保存登录后拿到的短期管理 token；管理员密码以 PBKDF2 哈希形式保存在数据库中，真正的大模型 API Key 只放在后端环境变量中。
 
 ## 下一步可扩展
 

@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import * as echarts from "echarts";
-import { Activity, BarChart3, Brain, CircleDollarSign, Plus, RefreshCw, TrendingUp } from "lucide-react";
+import { Activity, BarChart3, Brain, CircleDollarSign, LogIn, LogOut, Plus, RefreshCw, TrendingUp } from "lucide-react";
 
 import {
   createDcaPlan,
   createTransaction,
+  deleteDcaExecution,
   deleteDcaPlan,
   updateDcaPlan,
   deleteTransaction,
@@ -15,10 +16,13 @@ import {
   getLatestAdvice,
   getPortfolioSummary,
   getSnapshots,
+  getAdminMe,
   importAlipayPdf,
   listDcaExecutions,
   listDcaPlans,
   listTransactionsPage,
+  loginAdmin,
+  logoutAdmin,
   runDailyUpdate,
   streamAdviceChat,
 } from "./api";
@@ -35,6 +39,18 @@ const emptySummary = {
   holdings: [],
 };
 
+const ADMIN_SESSION_KEY = "my-financing-admin-session";
+
+function readStoredAdminSession() {
+  try {
+    const raw = sessionStorage.getItem(ADMIN_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    sessionStorage.removeItem(ADMIN_SESSION_KEY);
+    return null;
+  }
+}
+
 function App() {
   const [summary, setSummary] = useState(emptySummary);
   const [snapshots, setSnapshots] = useState([]);
@@ -47,11 +63,16 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [updatingNav, setUpdatingNav] = useState(false);
   const [error, setError] = useState("");
+  const [errorTitle, setErrorTitle] = useState("数据读取失败");
   const [updateResult, setUpdateResult] = useState(null);
+  const [adminSession, setAdminSession] = useState(() => readStoredAdminSession());
+  const adminToken = adminSession?.token || "";
+  const isAdmin = Boolean(adminToken);
 
   async function loadData() {
     setLoading(true);
     setError("");
+    setErrorTitle("数据读取失败");
     try {
       const [summaryData, snapshotData, transactionData, dcaPlanData, dcaExecutionData, adviceData] = await Promise.all([
         getPortfolioSummary(),
@@ -79,31 +100,80 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!adminToken) return undefined;
+    let cancelled = false;
+    getAdminMe(adminToken)
+      .then((me) => {
+        if (cancelled) return;
+        const nextSession = { ...adminSession, username: me.username, expires_at: me.expires_at };
+        setAdminSession(nextSession);
+        sessionStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(nextSession));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        sessionStorage.removeItem(ADMIN_SESSION_KEY);
+        setAdminSession(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adminToken]);
+
+  useEffect(() => {
     getSnapshots(snapshotPeriod).then(setSnapshots).catch(() => {});
   }, [snapshotPeriod]);
 
   async function updateNavs() {
-    const adminToken = window.prompt("请输入后端 ADMIN_TOKEN", localStorage.getItem("my-financing-admin-token") || "");
-    if (!adminToken) return;
+    if (!adminToken) {
+      setErrorTitle("需要管理权限");
+      setError("请先登录管理模式。");
+      return;
+    }
     setUpdatingNav(true);
     setError("");
+    setErrorTitle("更新净值失败");
     setUpdateResult(null);
     try {
       const result = await runDailyUpdate(adminToken);
-      localStorage.setItem("my-financing-admin-token", adminToken);
       setUpdateResult(result);
       await loadData();
     } catch (err) {
-      localStorage.removeItem("my-financing-admin-token");
-      setError(err.message);
+      if (err.status === 401) {
+        sessionStorage.removeItem(ADMIN_SESSION_KEY);
+        setAdminSession(null);
+        setError("登录已失效，请重新进入管理模式。");
+      } else {
+        setError(err.message);
+      }
     } finally {
       setUpdatingNav(false);
+    }
+  }
+
+  function handleLoggedIn(session) {
+    setAdminSession(session);
+    sessionStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(session));
+    setError("");
+  }
+
+  async function handleLogout() {
+    const token = adminToken;
+    sessionStorage.removeItem(ADMIN_SESSION_KEY);
+    setAdminSession(null);
+    if (token) {
+      try {
+        await logoutAdmin(token);
+      } catch {
+        // Session is already cleared locally; server-side revoke is best effort.
+      }
     }
   }
 
   if (page === "history") {
     return (
       <HistoryPage
+        isAdmin={isAdmin}
+        adminToken={adminToken}
         onBack={async () => {
           setPage("dashboard");
           await loadData();
@@ -125,14 +195,17 @@ function App() {
             <RefreshCw size={18} />
             刷新
           </button>
-          <button className="icon-button text-button" onClick={updateNavs} disabled={updatingNav} title="从 AKShare 更新基金净值">
-            <Activity size={18} />
-            {updatingNav ? "更新中" : "更新净值"}
-          </button>
+          {isAdmin && (
+            <button className="icon-button text-button" onClick={updateNavs} disabled={updatingNav} title="从 AKShare 更新基金净值">
+              <Activity size={18} />
+              {updatingNav ? "更新中" : "更新净值"}
+            </button>
+          )}
+          <AdminModeControl session={adminSession} onLoggedIn={handleLoggedIn} onLogout={handleLogout} />
         </div>
       </header>
 
-      {error && <div className="alert">后端暂不可用：{error}</div>}
+      {error && <div className="alert">{errorTitle}：{error}</div>}
       {updateResult && <UpdateResult result={updateResult} />}
 
       <section className="metric-grid">
@@ -160,16 +233,16 @@ function App() {
           <HoldingsTable holdings={summary.holdings} />
         </Panel>
         <Panel title="新增交易">
-          <TransactionForm onCreated={loadData} />
+          {isAdmin ? <TransactionForm onCreated={loadData} adminToken={adminToken} /> : <GuestNotice size="tall" text="访客模式下只能查看数据。进入管理模式后可新增交易。" />}
         </Panel>
       </section>
 
       <section className="content-grid" style={{marginTop: "16px"}}>
         <Panel title="定投计划">
-          <div className="scroll-panel"><DcaPlanList plans={dcaPlans} loading={loading} onChanged={loadData} /></div>
+          <div className="scroll-panel"><DcaPlanList plans={dcaPlans} loading={loading} onChanged={loadData} isAdmin={isAdmin} adminToken={adminToken} /></div>
         </Panel>
         <Panel title="定投执行">
-          <div className="scroll-panel"><DcaExecutionList executions={dcaExecutions} loading={loading} /></div>
+          <div className="scroll-panel"><DcaExecutionList executions={dcaExecutions} loading={loading} isAdmin={isAdmin} adminToken={adminToken} onChanged={loadData} /></div>
         </Panel>
       </section>
 
@@ -188,7 +261,7 @@ function App() {
 
       <section style={{marginTop: "16px"}}>
         <Panel title="AI 实时对话">
-          <ChatPanel advice={advice} />
+          <ChatPanel advice={advice} isAdmin={isAdmin} adminToken={adminToken} />
         </Panel>
       </section>
     </main>
@@ -237,7 +310,81 @@ function Panel({ title, children }) {
   );
 }
 
-function HistoryPage({ onBack, onChanged }) {
+function AdminModeControl({ session, onLoggedIn, onLogout }) {
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [form, setForm] = useState({ username: "cykkk", password: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const data = await loginAdmin(form);
+      onLoggedIn(data);
+      setForm((current) => ({ ...current, password: "" }));
+      setLoginOpen(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (session?.token) {
+    return (
+      <div className="admin-mode">
+        <span>管理模式 · {session.username}</span>
+        <button className="icon-button text-button" type="button" onClick={onLogout} title="退出管理模式">
+          <LogOut size={18} />
+          退出
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="admin-mode">
+      <span>访客模式</span>
+      {!loginOpen ? (
+        <button className="icon-button text-button" type="button" onClick={() => setLoginOpen(true)} title="进入管理模式">
+          <LogIn size={18} />
+          管理登录
+        </button>
+      ) : (
+        <form className="admin-login-form" onSubmit={submit}>
+          <input
+            value={form.username}
+            onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))}
+            placeholder="用户名"
+            autoComplete="username"
+          />
+          <input
+            type="password"
+            value={form.password}
+            onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))}
+            placeholder="密码"
+            autoComplete="current-password"
+          />
+          <button className="secondary-button compact" type="submit" disabled={busy || !form.username || !form.password}>
+            {busy ? "登录中" : "登录"}
+          </button>
+          <button className="ghost-button compact" type="button" onClick={() => { setLoginOpen(false); setError(""); }}>
+            取消
+          </button>
+          {error && <span className="auth-error">{error}</span>}
+        </form>
+      )}
+    </div>
+  );
+}
+
+function GuestNotice({ text, size = "" }) {
+  return <div className={`guest-notice ${size}`}>{text}</div>;
+}
+
+function HistoryPage({ onBack, onChanged, isAdmin, adminToken }) {
   const [filters, setFilters] = useState({ fundCode: "", transactionType: "", startDate: "", endDate: "" });
   const [transactions, setTransactions] = useState([]);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 10, total: 0, totalPages: 0 });
@@ -294,7 +441,7 @@ function HistoryPage({ onBack, onChanged }) {
       </header>
       {error && <div className="alert">交易读取失败：{error}</div>}
       <Panel title="全部交易">
-        <AlipayImportPanel onImported={handleChanged} />
+        {isAdmin && <AlipayImportPanel onImported={handleChanged} adminToken={adminToken} />}
         <TransactionList
           transactions={transactions}
           loading={loading}
@@ -303,13 +450,15 @@ function HistoryPage({ onBack, onChanged }) {
           onChanged={handleChanged}
           pagination={pagination}
           onPageChange={goToPage}
+          isAdmin={isAdmin}
+          adminToken={adminToken}
         />
       </Panel>
     </main>
   );
 }
 
-function AlipayImportPanel({ onImported }) {
+function AlipayImportPanel({ onImported, adminToken }) {
   const [file, setFile] = useState(null);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -326,7 +475,7 @@ function AlipayImportPanel({ onImported }) {
     setBusy(true);
     setError("");
     try {
-      const data = await importAlipayPdf(file, dryRun);
+      const data = await importAlipayPdf(file, dryRun, adminToken);
       setResult(data);
       if (!dryRun) {
         await onImported();
@@ -728,7 +877,7 @@ function HoldingsTable({ holdings }) {
   );
 }
 
-function TransactionForm({ onCreated }) {
+function TransactionForm({ onCreated, adminToken }) {
   const [form, setForm] = useState({
     fund_code: "",
     trade_date: new Date().toISOString().slice(0, 10),
@@ -797,7 +946,7 @@ function TransactionForm({ onCreated }) {
           end_date: form.dca_end_date || null,
           frequency: form.frequency,
           day_of_month: form.frequency_day ? Number(form.frequency_day) : null,
-        });
+        }, adminToken);
       } else {
         await createTransaction({
           ...form,
@@ -808,7 +957,7 @@ function TransactionForm({ onCreated }) {
           nav: form.nav || null,
           fee: form.fee || "0",
           initiated_at: `${form.trade_date}T${form.initiated_time || "00:00:00"}`,
-        });
+        }, adminToken);
       }
       setForm((current) => ({ ...current, amount: "", shares: "", nav: "", fee: "", dca_end_date: "", initiated_time: "", note: "" }));
       await onCreated();
@@ -1000,7 +1149,7 @@ function RecentTransactionList({ transactions, loading, onOpenHistory }) {
   );
 }
 
-function TransactionList({ transactions, loading, filters, onFilter, onChanged, pagination, onPageChange }) {
+function TransactionList({ transactions, loading, filters, onFilter, onChanged, pagination, onPageChange, isAdmin, adminToken }) {
   const [draft, setDraft] = useState(filters);
   const [deletingId, setDeletingId] = useState(null);
   const [batchMode, setBatchMode] = useState(false);
@@ -1031,11 +1180,23 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
   }
 
   async function removeTransaction(transactionId) {
-    const confirmed = window.confirm("确认撤销这笔交易吗？撤销后收益会重新计算。");
+    const confirmed = window.confirm("确认撤销这笔交易吗？撤销后收益会重新计算。定投确认交易会同时取消本次定投执行。");
     if (!confirmed) return;
     setDeletingId(transactionId);
     try {
-      await deleteTransaction(transactionId);
+      await deleteTransaction(transactionId, adminToken);
+      await onChanged();
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  async function removeDcaExecution(executionId) {
+    const confirmed = window.confirm("确认撤销本次定投执行吗？撤销后不会再自动确认这一次定投。");
+    if (!confirmed) return;
+    setDeletingId(`dca-execution-${executionId}`);
+    try {
+      await deleteDcaExecution(executionId, adminToken);
       await onChanged();
     } finally {
       setDeletingId(null);
@@ -1054,7 +1215,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
       batchEnd ? `到 ${batchEnd}` : "",
     ].filter(Boolean).join(" ");
     const confirmed = window.confirm(
-      `确认删除匹配的交易？\n条件：${desc}\n\n此操作不可撤销，关联的定投执行记录将重置为待确认状态。`
+      `确认删除匹配的交易？\n条件：${desc}\n\n此操作不可撤销，关联的定投执行记录将标记为已撤销。`
     );
     if (!confirmed) return;
     setBatchDeleting(true);
@@ -1064,7 +1225,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
         fundCode: fundCode || undefined,
         startDate: batchStart || undefined,
         endDate: batchEnd || undefined,
-      });
+      }, adminToken);
       setBatchResult(`已删除 ${result.deleted} 条交易`);
       await onChanged();
     } catch (error) {
@@ -1104,7 +1265,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
         <button className="secondary-button" type="submit">筛选</button>
         <button className="ghost-button" type="button" onClick={clearFilters}>清空</button>
       </form>
-      <div className="batch-delete-bar">
+      {isAdmin && <div className="batch-delete-bar">
         {!batchMode ? (
           <button className="ghost-button compact danger" type="button" onClick={() => setBatchMode(true)}>
             批量删除
@@ -1149,7 +1310,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
             {batchResult && <span className="batch-result">{batchResult}</span>}
           </div>
         )}
-      </div>
+      </div>}
       {!transactions.length ? (
         <EmptyState text="暂无交易记录。" />
       ) : (
@@ -1170,15 +1331,26 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
               </div>
               <div className="transaction-actions">
                 <b>{money(item.amount)}</b>
-                {!item.is_virtual && (
-                  <button
-                    className="danger-button"
-                    type="button"
-                    disabled={deletingId === item.id}
-                    onClick={() => removeTransaction(item.id)}
-                  >
-                    {deletingId === item.id ? "撤销中" : "撤销"}
-                  </button>
+                {isAdmin && (
+                  item.is_virtual ? (
+                    <button
+                      className="danger-button"
+                      type="button"
+                      disabled={deletingId === item.id}
+                      onClick={() => removeDcaExecution(dcaExecutionIdFromVirtualItem(item.id))}
+                    >
+                      {deletingId === item.id ? "撤销中" : "撤销"}
+                    </button>
+                  ) : (
+                    <button
+                      className="danger-button"
+                      type="button"
+                      disabled={deletingId === item.id}
+                      onClick={() => removeTransaction(item.id)}
+                    >
+                      {deletingId === item.id ? "撤销中" : "撤销"}
+                    </button>
+                  )
                 )}
               </div>
             </div>
@@ -1214,7 +1386,7 @@ function TransactionList({ transactions, loading, filters, onFilter, onChanged, 
   );
 }
 
-function DcaPlanList({ plans, loading, onChanged }) {
+function DcaPlanList({ plans, loading, onChanged, isAdmin, adminToken }) {
   const [deletingId, setDeletingId] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
@@ -1224,7 +1396,7 @@ function DcaPlanList({ plans, loading, onChanged }) {
     if (!window.confirm("确认删除该定投计划？关联的执行记录将被清除，已生成的交易不受影响。")) return;
     setDeletingId(planId);
     try {
-      await deleteDcaPlan(planId);
+      await deleteDcaPlan(planId, adminToken);
       if (onChanged) onChanged();
     } catch (err) {
       alert(err.message);
@@ -1264,7 +1436,7 @@ function DcaPlanList({ plans, loading, onChanged }) {
       if (editForm.day_of_month !== undefined) payload.day_of_month = editForm.day_of_month ? Number(editForm.day_of_month) : null;
       if (editForm.end_date !== undefined) payload.end_date = editForm.end_date || null;
       if (editForm.status) payload.status = editForm.status;
-      await updateDcaPlan(planId, payload);
+      await updateDcaPlan(planId, payload, adminToken);
       setEditingId(null);
       setEditForm({});
       if (onChanged) onChanged();
@@ -1352,14 +1524,18 @@ function DcaPlanList({ plans, loading, onChanged }) {
               </div>
               <div style={{display: "flex", alignItems: "center", gap: "8px"}}>
                 <b>{money(item.amount)}</b>
-                <button className="ghost-button compact" type="button" onClick={() => startEdit(item)} style={{fontSize: "0.75em", padding: "2px 6px"}}>编辑</button>
-                <button
-                  className="danger-button"
-                  type="button"
-                  disabled={deletingId === item.id}
-                  onClick={() => removePlan(item.id)}
-                  style={{fontSize: "0.75em", padding: "2px 6px"}}
-                >删除</button>
+                {isAdmin && (
+                  <>
+                    <button className="ghost-button compact" type="button" onClick={() => startEdit(item)} style={{fontSize: "0.75em", padding: "2px 6px"}}>编辑</button>
+                    <button
+                      className="danger-button"
+                      type="button"
+                      disabled={deletingId === item.id}
+                      onClick={() => removePlan(item.id)}
+                      style={{fontSize: "0.75em", padding: "2px 6px"}}
+                    >删除</button>
+                  </>
+                )}
               </div>
             </>
           )}
@@ -1369,7 +1545,22 @@ function DcaPlanList({ plans, loading, onChanged }) {
   );
 }
 
-function DcaExecutionList({ executions, loading }) {
+function DcaExecutionList({ executions, loading, isAdmin, adminToken, onChanged }) {
+  const [cancelingId, setCancelingId] = useState(null);
+
+  async function cancelExecution(executionId) {
+    if (!window.confirm("确认撤销本次定投执行吗？撤销后不会再自动确认这一次定投。")) return;
+    setCancelingId(executionId);
+    try {
+      await deleteDcaExecution(executionId, adminToken);
+      if (onChanged) await onChanged();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setCancelingId(null);
+    }
+  }
+
   if (loading) return <EmptyState text="正在读取定投执行记录。" />;
   if (!executions.length) return <EmptyState text="每日更新命中定投计划后，这里会显示执行状态。" />;
   return (
@@ -1384,7 +1575,19 @@ function DcaExecutionList({ executions, loading }) {
             </span>
             {item.nav && <span>净值 {item.nav} · 份额 {item.shares}</span>}
           </div>
-          <b>{money(item.amount)}</b>
+          <div className="transaction-actions">
+            <b>{money(item.amount)}</b>
+            {isAdmin && item.status !== "canceled" && (
+              <button
+                className="danger-button"
+                type="button"
+                disabled={cancelingId === item.id}
+                onClick={() => cancelExecution(item.id)}
+              >
+                {cancelingId === item.id ? "撤销中" : "撤销"}
+              </button>
+            )}
+          </div>
         </div>
       ))}
     </div>
@@ -1409,8 +1612,7 @@ function AdviceCard({ advice }) {
   );
 }
 
-function ChatPanel({ advice }) {
-  const [adminToken, setAdminToken] = useState(() => localStorage.getItem("my-financing-admin-token") || "");
+function ChatPanel({ advice, isAdmin, adminToken }) {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState(() => {
     if (!advice) return [];
@@ -1438,7 +1640,7 @@ function ChatPanel({ advice }) {
 
   async function submit(event) {
     event.preventDefault();
-    if (!input.trim() || !adminToken.trim()) return;
+    if (!input.trim() || !adminToken) return;
 
     const nextMessages = [...messages, { role: "user", content: input.trim() }];
     setMessages([...nextMessages, { role: "assistant", content: "" }]);
@@ -1447,7 +1649,7 @@ function ChatPanel({ advice }) {
     setStreaming(true);
 
     try {
-      await streamAdviceChat(nextMessages.slice(-12), adminToken.trim(), (chunk) => {
+      await streamAdviceChat(nextMessages.slice(-12), adminToken, (chunk) => {
         setMessages((current) => {
           const updated = [...current];
           const last = updated[updated.length - 1];
@@ -1455,9 +1657,7 @@ function ChatPanel({ advice }) {
           return updated;
         });
       });
-      localStorage.setItem("my-financing-admin-token", adminToken.trim());
     } catch (err) {
-      localStorage.removeItem("my-financing-admin-token");
       setError(err.message);
       setMessages((current) => current.slice(0, -1));
     } finally {
@@ -1467,15 +1667,6 @@ function ChatPanel({ advice }) {
 
   return (
     <div className="chat-panel">
-      <label>
-        管理 Token
-        <input
-          type="password"
-          value={adminToken}
-          onChange={(event) => setAdminToken(event.target.value)}
-          placeholder="后端 ADMIN_TOKEN"
-        />
-      </label>
       <div className="chat-log">
         {messages.length ? (
           messages.map((message, index) => (
@@ -1489,16 +1680,20 @@ function ChatPanel({ advice }) {
         )}
       </div>
       {error && <p className="chat-error">{error}</p>}
-      <form className="chat-form" onSubmit={submit}>
-        <input
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          placeholder="问问当前组合风险、定投节奏或某只基金是否该观察"
-        />
-        <button className="primary-button" disabled={streaming || !adminToken.trim()}>
-          {streaming ? "生成中" : "发送"}
-        </button>
-      </form>
+      {isAdmin ? (
+        <form className="chat-form" onSubmit={submit}>
+          <input
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            placeholder="问问当前组合风险、定投节奏或某只基金是否该观察"
+          />
+          <button className="primary-button" disabled={streaming || !adminToken}>
+            {streaming ? "生成中" : "发送"}
+          </button>
+        </form>
+      ) : (
+        <GuestNotice text="访客模式下可查看已有建议。进入管理模式后可继续 AI 对话。" />
+      )}
     </div>
   );
 }
@@ -1551,7 +1746,11 @@ function weekdayName(day) {
 }
 
 function statusName(status) {
-  return { pending: "待确认", confirmed: "已确认", skipped: "已跳过" }[status] || status;
+  return { pending: "待确认", confirmed: "已确认", canceled: "已撤销", skipped: "已跳过" }[status] || status;
+}
+
+function dcaExecutionIdFromVirtualItem(id) {
+  return Number(String(id || "").replace("dca-execution-", ""));
 }
 
 function timeStr(value) {

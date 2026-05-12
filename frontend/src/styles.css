@@ -42,6 +42,43 @@ select {
   flex-wrap: wrap;
 }
 
+.admin-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-mode > span {
+  min-height: 32px;
+  padding: 7px 10px;
+  border: 1px solid #d7dde8;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.admin-login-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-login-form input {
+  width: 150px;
+  min-height: 32px;
+  font-size: 13px;
+}
+
+.auth-error {
+  color: #991b1b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .eyebrow {
   margin: 0 0 6px;
   color: #64748b;
@@ -443,6 +480,26 @@ select {
   line-height: 1.4;
 }
 
+.guest-notice {
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+  padding: 18px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #64748b;
+  text-align: center;
+}
+
+.guest-notice.tall {
+  min-height: 400px;
+}
+
+.content-grid.equal-height .panel > .guest-notice.tall {
+  min-height: 400px;
+}
+
 .transaction-list {
   display: grid;
   gap: 10px;
@@ -577,6 +634,12 @@ select {
 }
 
 .ghost-button.compact {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.secondary-button.compact {
   min-height: 32px;
   padding: 0 10px;
   font-size: 13px;
@@ -751,6 +814,11 @@ select {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .admin-login-form,
+  .admin-login-form input {
+    width: 100%;
   }
 
   .field-row {

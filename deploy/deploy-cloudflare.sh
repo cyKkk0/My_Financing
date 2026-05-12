@@ -6,7 +6,6 @@ APP_USER="${SUDO_USER:-$(id -un)}"
 DOMAIN="myfinancing.asia"
 API_PORT="8000"
 CONDA_ENV_NAME="my-financing"
-ADMIN_TOKEN_VALUE="${ADMIN_TOKEN:-}"
 CLOUDFLARED_TOKEN_VALUE="${CLOUDFLARED_TOKEN:-}"
 INSTALL_SCHEDULED_TASKS=1
 MANAGE_CLOUDFLARED=1
@@ -31,7 +30,6 @@ Options:
   --domain DOMAIN             Public domain. Defaults to myfinancing.asia.
   --api-port PORT             Local FastAPI port. Defaults to 8000.
   --conda-env NAME            Prefer this conda env. Defaults to my-financing.
-  --admin-token TOKEN         Backend admin token. Defaults to ADMIN_TOKEN or backend/.env.
   --cloudflared-token TOKEN   Cloudflare Tunnel token. Defaults to CLOUDFLARED_TOKEN.
   --use-existing-cloudflared  Do not create a cloudflared service or require a token.
   --no-scheduled-tasks        Do not install cron jobs.
@@ -59,10 +57,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --conda-env)
       CONDA_ENV_NAME="$2"
-      shift 2
-      ;;
-    --admin-token)
-      ADMIN_TOKEN_VALUE="$2"
       shift 2
       ;;
     --cloudflared-token)
@@ -119,16 +113,10 @@ if [ "$MANAGE_CLOUDFLARED" -eq 1 ] && [ -z "$CLOUDFLARED_TOKEN_VALUE" ]; then
 fi
 
 BACKEND_ENV="$APP_DIR/backend/.env"
-if [ -z "$ADMIN_TOKEN_VALUE" ] && [ -f "$BACKEND_ENV" ]; then
-  ADMIN_TOKEN_VALUE="$(grep -E '^ADMIN_TOKEN=' "$BACKEND_ENV" | tail -n 1 | cut -d= -f2- || true)"
-fi
-if [ -z "$ADMIN_TOKEN_VALUE" ]; then
-  ADMIN_TOKEN_VALUE="$(openssl rand -hex 24)"
-fi
 
 echo "=== 1/9 Verify required system tools ==="
 missing_tools=()
-for tool in nginx curl openssl; do
+for tool in nginx curl; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     missing_tools+=("$tool")
   fi
@@ -179,7 +167,7 @@ set_env() {
 
 set_env "DATABASE_URL" "sqlite:///./finance.sqlite3"
 set_env "FRONTEND_ORIGINS" "https://${DOMAIN},http://localhost:5173,http://127.0.0.1:5173"
-set_env "ADMIN_TOKEN" "$ADMIN_TOKEN_VALUE"
+set_env "ADMIN_SESSION_HOURS" "12"
 grep -qE '^LLM_API_BASE=' "$BACKEND_ENV" || echo "LLM_API_BASE=https://api.openai.com/v1" >> "$BACKEND_ENV"
 grep -qE '^LLM_MODEL=' "$BACKEND_ENV" || echo "LLM_MODEL=gpt-4o-mini" >> "$BACKEND_ENV"
 grep -qE '^LLM_API_KEY=' "$BACKEND_ENV" || echo "LLM_API_KEY=" >> "$BACKEND_ENV"
@@ -325,8 +313,8 @@ if [ "$INSTALL_SCHEDULED_TASKS" -eq 1 ]; then
   "$APP_DIR/deploy/install-scheduled-tasks.sh" \
     --app-dir "$APP_DIR" \
     --user "$APP_USER" \
-    --api-base "http://127.0.0.1:${API_PORT}" \
-    --token "$ADMIN_TOKEN_VALUE"
+    --conda-env "$CONDA_ENV_NAME" \
+    --python-bin "$PYTHON_BIN"
 else
   echo "Skipped scheduled tasks."
 fi
@@ -342,6 +330,6 @@ fi
 echo ""
 echo "Deployment finished."
 echo "Public URL: https://${DOMAIN}"
-echo "Admin token was written to ${BACKEND_ENV}."
+echo "Default admin user is initialized in the database on first backend startup."
 echo "If the URL is not live yet, check the Cloudflare Tunnel public hostname:"
 echo "  ${DOMAIN} -> http://127.0.0.1:80"

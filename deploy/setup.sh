@@ -20,7 +20,7 @@ echo "=== 4/5 设置每日定时任务 ==="
 /home/cykkk/github_proj/My_Financing/deploy/install-scheduled-tasks.sh \
   --app-dir /home/cykkk/github_proj/My_Financing \
   --user cykkk \
-  --api-base http://127.0.0.1:8000
+  --conda-env my-financing
 
 echo "=== 5/6 修复 Nginx 访问权限 ==="
 chmod o+x /home/cykkk

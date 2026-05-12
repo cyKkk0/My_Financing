@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.core.config import Settings, get_settings
+from app.core.security import generate_session_token, hash_session_token, verify_password
 from app.db.database import get_db
 from app.jobs.update_daily import run_dca_check, update_daily_navs_and_snapshot
 from app.schemas import (
+    AdminMeOut,
     AdviceOut,
     AlipayPdfImportOut,
     ChatRequest,
@@ -19,6 +21,8 @@ from app.schemas import (
     DcaPlanOut,
     DcaPlanUpdate,
     FundPerformancePoint,
+    LoginRequest,
+    LoginResponse,
     PortfolioSummaryOut,
     TransactionCreate,
     TransactionOut,
@@ -36,13 +40,96 @@ from app.services.trading_calendar import ensure_trading_calendar_coverage
 router = APIRouter()
 
 
+def _require_admin_session(
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+) -> tuple[models.AdminUser, models.AdminSession]:
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="请先登录管理模式")
+
+    now = datetime.utcnow()
+    session = db.scalar(
+        select(models.AdminSession).where(
+            models.AdminSession.token_hash == hash_session_token(token),
+            models.AdminSession.revoked_at.is_(None),
+            models.AdminSession.expires_at > now,
+        )
+    )
+    if session is None:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+
+    user = db.get(models.AdminUser, session.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="管理员账号不可用")
+    return user, session
+
+
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token.strip()
+
+
+def require_admin_user(
+    context: tuple[models.AdminUser, models.AdminSession] = Depends(_require_admin_session),
+) -> models.AdminUser:
+    user, _session = context
+    return user
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.post("/auth/login", response_model=LoginResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db), settings: Settings = Depends(get_settings)) -> LoginResponse:
+    user = db.scalar(select(models.AdminUser).where(models.AdminUser.username == payload.username))
+    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
+
+    now = datetime.utcnow()
+    expires_at = now + timedelta(hours=settings.admin_session_hours)
+    token = generate_session_token()
+    db.add(
+        models.AdminSession(
+            user_id=user.id,
+            token_hash=hash_session_token(token),
+            expires_at=expires_at,
+        )
+    )
+    user.last_login_at = now
+    db.commit()
+    return LoginResponse(token=token, username=user.username, expires_at=expires_at)
+
+
+@router.get("/auth/me", response_model=AdminMeOut)
+def auth_me(context: tuple[models.AdminUser, models.AdminSession] = Depends(_require_admin_session)) -> AdminMeOut:
+    user, session = context
+    return AdminMeOut(username=user.username, expires_at=session.expires_at)
+
+
+@router.post("/auth/logout")
+def logout(
+    context: tuple[models.AdminUser, models.AdminSession] = Depends(_require_admin_session),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _user, session = context
+    session.revoked_at = datetime.utcnow()
+    db.commit()
+    return {"ok": "logged_out"}
+
+
 @router.post("/transactions", response_model=TransactionOut)
-def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)) -> models.Transaction:
+def create_transaction(
+    payload: TransactionCreate,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> models.Transaction:
     fund_name = payload.fund_name or _resolve_fund_name(payload.fund_code)
     if not fund_name:
         raise HTTPException(status_code=400, detail=f"无法识别基金代码 {payload.fund_code}，未找到对应的基金名称")
@@ -248,7 +335,10 @@ def _combined_transaction_items(
     if transaction_type and transaction_type != "buy":
         executions = []
     else:
-        execution_query = select(models.DcaExecution).where(models.DcaExecution.transaction_id.is_(None))
+        execution_query = select(models.DcaExecution).where(
+            models.DcaExecution.transaction_id.is_(None),
+            models.DcaExecution.status == "pending",
+        )
         if fund_code:
             execution_query = execution_query.where(models.DcaExecution.fund_code == fund_code.zfill(6))
         if start_date:
@@ -319,8 +409,21 @@ def _transaction_source_label(tx: models.Transaction) -> str | None:
     return None
 
 
+def _cancel_dca_execution(execution: models.DcaExecution) -> None:
+    execution.status = "canceled"
+    execution.confirmed_date = None
+    execution.nav = None
+    execution.shares = None
+    execution.transaction_id = None
+    execution.note = "本次定投执行已撤销"
+
+
 @router.delete("/transactions/{transaction_id}")
-def delete_transaction(transaction_id: int, db: Session = Depends(get_db)) -> dict[str, int | str]:
+def delete_transaction(
+    transaction_id: int,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> dict[str, int | str]:
     tx = db.get(models.Transaction, transaction_id)
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -329,12 +432,7 @@ def delete_transaction(transaction_id: int, db: Session = Depends(get_db)) -> di
         select(models.DcaExecution).where(models.DcaExecution.transaction_id == transaction_id)
     )
     if execution is not None:
-        execution.status = "pending"
-        execution.confirmed_date = None
-        execution.nav = None
-        execution.shares = None
-        execution.transaction_id = None
-        execution.note = "关联交易已撤销，等待重新确认"
+        _cancel_dca_execution(execution)
 
     db.delete(tx)
     db.commit()
@@ -347,6 +445,7 @@ def delete_transactions_batch(
     start_date: date | None = None,
     end_date: date | None = None,
     db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, int]:
     if not fund_code and not start_date and not end_date:
         raise HTTPException(status_code=400, detail="至少需要指定基金代码或日期范围")
@@ -370,12 +469,7 @@ def delete_transactions_batch(
         select(models.DcaExecution).where(models.DcaExecution.transaction_id.in_(tx_ids))
     ).all()
     for execution in linked_executions:
-        execution.status = "pending"
-        execution.confirmed_date = None
-        execution.nav = None
-        execution.shares = None
-        execution.transaction_id = None
-        execution.note = "关联交易已撤销，等待重新确认"
+        _cancel_dca_execution(execution)
 
     for tx in transactions:
         db.delete(tx)
@@ -389,6 +483,7 @@ async def import_alipay_pdf(
     file: UploadFile = File(...),
     dry_run: bool = Form(True),
     db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> AlipayPdfImportOut:
     try:
         pdf_bytes = await file.read()
@@ -460,7 +555,11 @@ async def import_alipay_pdf(
 
 
 @router.post("/dca-plans", response_model=DcaPlanOut)
-def create_dca_plan(payload: DcaPlanCreate, db: Session = Depends(get_db)) -> models.DcaPlan:
+def create_dca_plan(
+    payload: DcaPlanCreate,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> models.DcaPlan:
     fund_name = payload.fund_name or _resolve_fund_name(payload.fund_code)
     fund = db.get(models.Fund, payload.fund_code)
     if fund is None:
@@ -520,7 +619,12 @@ def list_dca_plans(db: Session = Depends(get_db)) -> list[DcaPlanOut]:
 
 
 @router.put("/dca-plans/{plan_id}", response_model=DcaPlanOut)
-def update_dca_plan(plan_id: int, payload: DcaPlanUpdate, db: Session = Depends(get_db)) -> models.DcaPlan:
+def update_dca_plan(
+    plan_id: int,
+    payload: DcaPlanUpdate,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> models.DcaPlan:
     plan = db.get(models.DcaPlan, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="定投计划不存在")
@@ -542,7 +646,11 @@ def update_dca_plan(plan_id: int, payload: DcaPlanUpdate, db: Session = Depends(
 
 
 @router.delete("/dca-plans/{plan_id}")
-def delete_dca_plan(plan_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+def delete_dca_plan(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> dict[str, str]:
     plan = db.get(models.DcaPlan, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="定投计划不存在")
@@ -551,6 +659,31 @@ def delete_dca_plan(plan_id: int, db: Session = Depends(get_db)) -> dict[str, st
     db.delete(plan)
     db.commit()
     return {"ok": "deleted"}
+
+
+@router.delete("/dca-executions/{execution_id}")
+def cancel_dca_execution(
+    execution_id: int,
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> dict[str, int | str | None]:
+    execution = db.get(models.DcaExecution, execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="定投执行记录不存在")
+
+    deleted_transaction_id = execution.transaction_id
+    if execution.transaction_id is not None:
+        tx = db.get(models.Transaction, execution.transaction_id)
+        if tx is not None:
+            db.delete(tx)
+
+    _cancel_dca_execution(execution)
+    db.commit()
+    return {
+        "canceled_execution_id": execution_id,
+        "deleted_transaction_id": deleted_transaction_id,
+        "status": execution.status,
+    }
 
 
 @router.get("/dca-executions", response_model=list[DcaExecutionOut])
@@ -624,8 +757,6 @@ def fund_performance(
                     daily_growth_rate=row.get("daily_growth_rate"),
                     source="akshare_history",
                 )
-                db.add(stored[nav_date])
-        db.commit()
     except Exception:
         pass
 
@@ -673,7 +804,10 @@ def portfolio_summary(db: Session = Depends(get_db)) -> PortfolioSummaryOut:
 
 
 @router.post("/portfolio/snapshot")
-def create_snapshot(db: Session = Depends(get_db)) -> dict[str, str]:
+def create_snapshot(
+    db: Session = Depends(get_db),
+    _admin: models.AdminUser = Depends(require_admin_user),
+) -> dict[str, str]:
     snapshot = save_snapshot(db)
     return {"snapshot_date": snapshot.snapshot_date.isoformat()}
 
@@ -712,30 +846,24 @@ def list_snapshots(period: str = "month", db: Session = Depends(get_db)) -> list
 @router.post("/jobs/daily-update")
 def daily_update(
     db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, int | str]:
-    _require_admin_token(settings, x_admin_token)
     return update_daily_navs_and_snapshot(db)
 
 
 @router.post("/jobs/dca-check")
 def dca_check(
     db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, int]:
-    _require_admin_token(settings, x_admin_token)
     return run_dca_check(db)
 
 
 @router.post("/jobs/confirm-pending-transactions")
 def confirm_pending(
     db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, int]:
-    _require_admin_token(settings, x_admin_token)
     from app.jobs.update_daily import confirm_pending_transactions
     return confirm_pending_transactions(db)
 
@@ -743,20 +871,16 @@ def confirm_pending(
 @router.post("/jobs/refresh-trading-calendar")
 def refresh_calendar(
     db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, object]:
-    _require_admin_token(settings, x_admin_token)
     return ensure_trading_calendar_coverage(db, force=True)
 
 
 @router.post("/funds/refresh-names")
 def refresh_fund_names(
     db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> dict[str, int | str]:
-    _require_admin_token(settings, x_admin_token)
     try:
         name_map = AkshareFundClient().fund_name_map()
     except Exception as exc:
@@ -778,9 +902,8 @@ def refresh_fund_names(
 async def daily_advice(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> AdviceOut:
-    _require_admin_token(settings, x_admin_token)
     summary = calculate_portfolio_summary(db)
     content = await generate_advice(settings, summary)
     report = models.AdviceReport(report_date=date.today(), content=content, model=settings.llm_model)
@@ -802,20 +925,14 @@ async def chat_advice(
     payload: ChatRequest,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
-    x_admin_token: str | None = Header(default=None),
+    _admin: models.AdminUser = Depends(require_admin_user),
 ) -> StreamingResponse:
-    _require_admin_token(settings, x_admin_token)
     summary = calculate_portfolio_summary(db)
     messages = [message.model_dump() for message in payload.messages]
     return StreamingResponse(
         stream_chat_advice(settings, summary, messages),
         media_type="text/plain; charset=utf-8",
     )
-
-
-def _require_admin_token(settings: Settings, token: str | None) -> None:
-    if not token or token != settings.admin_token:
-        raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
 def _resolve_fund_name(fund_code: str) -> str | None:

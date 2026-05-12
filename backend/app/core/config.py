@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     app_name: str = "My Financing API"
     database_url: str = "sqlite:///./finance.sqlite3"
     frontend_origins: str = "http://localhost:5173"
-    admin_token: str = "change-me"
+    admin_session_hours: int = 12
     llm_api_base: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
@@ -26,4 +26,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

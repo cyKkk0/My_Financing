@@ -215,7 +215,8 @@ if [ "$SKIP_SCHEDULED_TASKS" -eq 0 ]; then
   "$APP_DIR/deploy/install-scheduled-tasks.sh" \
     --app-dir "$APP_DIR" \
     --user "$APP_USER" \
-    --api-base "http://127.0.0.1:${API_PORT}"
+    --conda-env "$CONDA_ENV_NAME" \
+    --python-bin "$PYTHON_BIN"
 else
   echo "Skipped scheduled tasks."
 fi

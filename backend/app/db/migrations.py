@@ -2,13 +2,22 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 
+DEFAULT_ADMIN_USERNAME = "cykkk"
+DEFAULT_ADMIN_PASSWORD_HASH = (
+    "pbkdf2_sha256$260000$vdm_fNM6pqoCWai8tzFlUA$"
+    "gD_U5v8Y9a_uH20XOGdDaiQyiUB4wTd6P5eW5fceo2g"
+)
+
+
 def ensure_lightweight_migrations(engine: Engine) -> None:
     if engine.dialect.name != "sqlite":
+        ensure_default_admin_user(engine)
         return
 
     inspector = inspect(engine)
     if "dca_plans" not in inspector.get_table_names():
         _migrate_transactions(engine, inspector)
+        ensure_default_admin_user(engine)
         return
 
     statements: list[str] = []
@@ -27,11 +36,36 @@ def ensure_lightweight_migrations(engine: Engine) -> None:
     statements.extend(transaction_statements)
 
     if not statements:
+        ensure_default_admin_user(engine)
         return
 
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+    ensure_default_admin_user(engine)
+
+
+def ensure_default_admin_user(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if "admin_users" not in inspector.get_table_names():
+        return
+
+    with engine.begin() as connection:
+        admin_count = connection.execute(text("SELECT COUNT(*) FROM admin_users")).scalar_one()
+        if admin_count:
+            return
+        connection.execute(
+            text(
+                """
+                INSERT INTO admin_users (username, password_hash, is_active)
+                VALUES (:username, :password_hash, 1)
+                """
+            ),
+            {
+                "username": DEFAULT_ADMIN_USERNAME,
+                "password_hash": DEFAULT_ADMIN_PASSWORD_HASH,
+            },
+        )
 
 
 def _migrate_transactions(engine: Engine, inspector) -> None:
