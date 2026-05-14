@@ -391,6 +391,48 @@ th {
   font-weight: 700;
 }
 
+.sortable-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.sort-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  width: 20px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.sort-button:hover,
+.sort-button.active {
+  border-color: #d7dde8;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.sort-button svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2.4;
+}
+
+.sort-button svg + svg {
+  margin-top: -4px;
+}
+
+.sort-button .selected {
+  color: #2563eb;
+}
+
 td span,
 .transaction-item span,
 .advice-card span {

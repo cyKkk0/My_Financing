@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import * as echarts from "echarts";
-import { Activity, ArrowLeft, BarChart3, Brain, CircleDollarSign, Clock3, LogIn, LogOut, Plus, RefreshCw, TrendingUp } from "lucide-react";
+import { Activity, ArrowLeft, BarChart3, Brain, ChevronDown, ChevronUp, CircleDollarSign, Clock3, LogIn, LogOut, Plus, RefreshCw, TrendingUp } from "lucide-react";
 
 import {
   createDcaPlan,
@@ -41,6 +41,17 @@ const emptySummary = {
 };
 
 const ADMIN_SESSION_KEY = "my-financing-admin-session";
+
+const HOLDING_SORT_COLUMNS = [
+  { key: "fund", label: "基金", type: "text" },
+  { key: "shares", label: "份额", type: "number" },
+  { key: "latest_nav", label: "净值", type: "number" },
+  { key: "market_value", label: "市值", type: "number" },
+  { key: "daily_pnl", label: "当日盈亏", type: "number" },
+  { key: "holding_profit", label: "持有收益", type: "number" },
+  { key: "cumulative_profit", label: "累计收益", type: "number" },
+  { key: "holding_profit_rate", label: "持有收益率", type: "number" },
+];
 
 function readStoredAdminSession() {
   try {
@@ -886,7 +897,30 @@ function DecisionRow({ label, value, tone = "" }) {
 
 function HoldingsTable({ holdings, onOpenFund }) {
   const [estimates, setEstimates] = useState({});
+  const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
   const estimateCodes = holdings.map((item) => item.fund_code).join("|");
+  const sortedHoldings = useMemo(() => {
+    if (!sortConfig.key || !sortConfig.direction) return holdings;
+
+    const column = HOLDING_SORT_COLUMNS.find((item) => item.key === sortConfig.key);
+    if (!column) return holdings;
+
+    return holdings
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => {
+        const comparison = compareHoldingSortValues(left.item, right.item, column, sortConfig.direction);
+        return comparison || left.index - right.index;
+      })
+      .map(({ item }) => item);
+  }, [holdings, sortConfig]);
+
+  function handleSortColumn(key) {
+    setSortConfig((current) => {
+      if (current.key !== key) return { key, direction: "asc" };
+      if (current.direction === "asc") return { key, direction: "desc" };
+      return { key: null, direction: null };
+    });
+  }
 
   useEffect(() => {
     if (!holdings.length) {
@@ -920,18 +954,18 @@ function HoldingsTable({ holdings, onOpenFund }) {
       <table>
         <thead>
           <tr>
-            <th>基金</th>
-            <th>份额</th>
-            <th>净值</th>
-            <th>市值</th>
-            <th>当日盈亏</th>
-            <th>持有收益</th>
-            <th>累计收益</th>
-            <th>持有收益率</th>
+            {HOLDING_SORT_COLUMNS.map((column) => (
+              <SortableHoldingHeader
+                key={column.key}
+                column={column}
+                sortConfig={sortConfig}
+                onSort={handleSortColumn}
+              />
+            ))}
           </tr>
         </thead>
         <tbody>
-          {holdings.map((item) => {
+          {sortedHoldings.map((item) => {
             const estimatedDailyPnl = estimateDailyPnlForHolding(item, estimates[item.fund_code]);
             return (
               <tr key={item.fund_code}>
@@ -967,6 +1001,69 @@ function HoldingsTable({ holdings, onOpenFund }) {
       </table>
     </div>
   );
+}
+
+function SortableHoldingHeader({ column, sortConfig, onSort }) {
+  const isActive = sortConfig.key === column.key;
+  const direction = isActive ? sortConfig.direction : null;
+  const title = direction === "asc" ? `按${column.label}倒序排序` : direction === "desc" ? `取消${column.label}排序` : `按${column.label}正序排序`;
+
+  return (
+    <th scope="col">
+      <span className="sortable-header">
+        <span>{column.label}</span>
+        <button
+          className={`sort-button${isActive ? " active" : ""}`}
+          type="button"
+          onClick={() => onSort(column.key)}
+          title={title}
+          aria-label={title}
+          aria-pressed={isActive}
+        >
+          <ChevronUp className={direction === "asc" ? "selected" : ""} aria-hidden="true" />
+          <ChevronDown className={direction === "desc" ? "selected" : ""} aria-hidden="true" />
+        </button>
+      </span>
+    </th>
+  );
+}
+
+function compareHoldingSortValues(left, right, column, direction) {
+  const leftValue = getHoldingSortValue(left, column.key);
+  const rightValue = getHoldingSortValue(right, column.key);
+
+  if (column.type === "text") {
+    const comparison = String(leftValue || "").localeCompare(String(rightValue || ""), "zh-CN", {
+      numeric: true,
+      sensitivity: "base",
+    });
+    return direction === "asc" ? comparison : -comparison;
+  }
+
+  const leftNumber = toSortableNumber(leftValue);
+  const rightNumber = toSortableNumber(rightValue);
+  const leftMissing = leftNumber == null;
+  const rightMissing = rightNumber == null;
+  if (leftMissing && rightMissing) return 0;
+  if (leftMissing) return 1;
+  if (rightMissing) return -1;
+
+  const comparison = leftNumber - rightNumber;
+  return direction === "asc" ? comparison : -comparison;
+}
+
+function getHoldingSortValue(item, key) {
+  if (key === "fund") return item.fund_name || item.fund_code || "";
+  if (key === "holding_profit") return item.holding_profit ?? item.profit;
+  if (key === "cumulative_profit") return item.cumulative_profit ?? item.profit;
+  if (key === "holding_profit_rate") return item.holding_profit_rate ?? item.profit_rate;
+  return item[key];
+}
+
+function toSortableNumber(value) {
+  if (value == null || value === "") return null;
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
 }
 
 function estimateDailyPnlForHolding(item, estimate) {
