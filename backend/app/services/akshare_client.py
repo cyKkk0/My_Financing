@@ -85,6 +85,21 @@ class AkshareFundClient:
             return None
         return trade_confirm_days_from_frame(df, transaction_type)
 
+    def redemption_fee_tiers(self, fund_code: str) -> list[dict[str, object]]:
+        """Return redemption fee tiers for a fund from AKShare.
+
+        Each tier is {"min_days": int, "max_days": int | None, "rate": Decimal}.
+        max_days=None means no upper bound.
+        Returns empty list if data is unavailable.
+        """
+        try:
+            df = self.ak.fund_fee_em(symbol=fund_code.zfill(6), indicator="赎回费率")
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        return _parse_redemption_tiers(df)
+
     def confirm_date_from_trade(
         self,
         fund_code: str,
@@ -262,6 +277,60 @@ class AkshareFundClient:
             "source": "akshare_history",
         }
 
+    def daily_nav_snapshot_index(self) -> dict[str, dict[str, Any]]:
+        """Query fund_open_fund_daily_em once and index by fund code.
+
+        This API often carries today's NAV before the history-series endpoint
+        (fund_open_fund_info_em) is updated, so it can supplement stale history.
+
+        Column format: YYYY-MM-DD-单位净值, YYYY-MM-DD-累计净值 (dates embedded in names).
+        """
+        import re
+
+        try:
+            df = self.daily_open_fund_navs()
+        except Exception:
+            return {}
+        if df.empty:
+            return {}
+        code_col = _first_present_column(df, ["基金代码", "代码"])
+        if code_col is None:
+            return {}
+
+        # Collect date-NV columns: find the latest date per row
+        date_nav_pat = re.compile(r"^(\d{4}-\d{2}-\d{2})-单位净值$")
+        date_nav_cols: list[tuple[date, str]] = []
+        for col in df.columns:
+            m = date_nav_pat.match(col)
+            if m:
+                date_nav_cols.append((pd.to_datetime(m.group(1)).date(), col))
+
+        if not date_nav_cols:
+            return {}
+
+        # Keep only the latest date per fund
+        date_nav_cols.sort(reverse=True, key=lambda x: x[0])
+        latest_date = date_nav_cols[0][0]
+        latest_unit_col = date_nav_cols[0][1]
+        latest_accum_col = _first_present_column(df, [f"{latest_date.isoformat()}-累计净值"])
+        growth_col = _first_present_column(df, ["日增长率", "日涨幅", "日增长"])
+
+        result: dict[str, dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            code = str(row[code_col]).strip().zfill(6)
+            unit_nav = _decimal_or_none(row.get(latest_unit_col))
+            if unit_nav is None:
+                continue
+            result[code] = {
+                "nav_date": latest_date,
+                "unit_nav": unit_nav,
+                "accumulated_nav": _decimal_or_none(row.get(latest_accum_col)) if latest_accum_col else None,
+                "daily_growth_rate": _decimal_or_none(row.get(growth_col)) if growth_col else None,
+                "name": code,
+                "source": "akshare_daily_snapshot",
+            }
+        return result
+
     def _latest_nav_from_history(self, fund_code: str) -> dict[str, Any] | None:
         rows = self.history_navs(fund_code)
         if not rows:
@@ -342,3 +411,96 @@ def _first_present_column(df: pd.DataFrame, candidates: list[str]) -> str | None
         if column in df.columns:
             return column
     return None
+
+
+def _parse_redemption_tiers(df: pd.DataFrame) -> list[dict[str, object]]:
+    """Parse AKShare fund_fee_em redemption fee DataFrame into tier list.
+
+    Handles common holding-period formats:
+    - "小于7天" -> min=0, max=6
+    - "7天-30天" -> min=7, max=29
+    - "大于730天" -> min=731, max=None
+    - "7天≤持有时间<30天" -> min=7, max=29
+    """
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    tiers: list[dict[str, object]] = []
+    for _, row in df.iterrows():
+        values = [str(v).strip() for v in row.values]
+        holding_text = ""
+        rate_value = None
+        for v in values:
+            if v in ("", "nan", "None", "暂无数据"):
+                continue
+            if rate_value is not None:
+                break
+            pct = _parse_percentage(v)
+            if pct is not None:
+                rate_value = pct
+            else:
+                holding_text = v
+
+        if rate_value is None:
+            continue
+
+        min_days, max_days = _parse_holding_range(holding_text)
+        tiers.append({"min_days": min_days, "max_days": max_days, "rate": rate_value})
+
+    return tiers
+
+
+def _parse_percentage(text: str) -> Decimal | None:
+    """Parse a percentage string like '1.50%' or '0.75%' to Decimal."""
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    match = re.search(r"(\d+\.?\d*)\s*%", text.strip())
+    if not match:
+        return None
+    try:
+        return Decimal(match.group(1)) / Decimal("100")
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_holding_range(text: str) -> tuple[int, int | None]:
+    """Parse holding period description into (min_days, max_days).
+
+    Handles AKShare formats from fund_fee_em:
+    - "小于等于6天" -> (0, 6)
+    - "大于等于7天，小于等于29天" -> (7, 29)
+    - "大于等于730天" -> (730, None)
+    - "小于7天" -> (0, 6)
+    - "大于730天" -> (731, None)
+
+    max_days=None means no upper bound.
+    """
+    import re
+
+    numbers = [int(m) for m in re.findall(r"\d+", text)]
+    if not numbers:
+        return 0, None
+
+    # Detect inclusive/exclusive qualifiers
+    has_dengyu = "等于" in text or "≤" in text or "≥" in text
+
+    # Compound range: two conditions separated by comma or Chinese comma
+    if len(numbers) >= 2 and re.search(r"[，,]", text):
+        lo, hi = numbers[0], numbers[1]
+        return lo, hi if has_dengyu else hi - 1
+
+    # Simple range with dash: "7天-30天"
+    if len(numbers) >= 2:
+        return numbers[0], numbers[1] - 1
+
+    # Single condition
+    n = numbers[0]
+    if "小于" in text:
+        return 0, n if has_dengyu else n - 1
+    if "大于" in text:
+        return n if has_dengyu else n + 1, None
+    if "以上" in text:
+        return n, None
+
+    return 0, None

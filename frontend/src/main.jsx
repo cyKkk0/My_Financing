@@ -893,6 +893,7 @@ function TransactionForm({ onCreated, adminToken }) {
     note: "",
   });
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [navStatus, setNavStatus] = useState("");
   const [lastEdited, setLastEdited] = useState("amount");
   const calculated = calculateTransactionFields(form, lastEdited);
@@ -905,7 +906,9 @@ function TransactionForm({ onCreated, adminToken }) {
       !form.nav &&
       form.transaction_type !== "dividend" &&
       form.transaction_type !== "fee" &&
-      form.transaction_type !== "dca";
+      form.transaction_type !== "dca" &&
+      form.transaction_type !== "buy" &&
+      form.transaction_type !== "sell";
     if (!shouldFetch) return undefined;
 
     let cancelled = false;
@@ -932,9 +935,22 @@ function TransactionForm({ onCreated, adminToken }) {
     };
   }, [form.fund_code, form.trade_date, form.nav, form.transaction_type]);
 
+  useEffect(() => {
+    const fundCode = normalizeFundCode(form.fund_code);
+    if (
+      /^\d{6}$/.test(fundCode) &&
+      form.trade_date &&
+      (form.transaction_type === "buy" || form.transaction_type === "sell")
+    ) {
+      const timeHint = form.initiated_time && form.initiated_time >= "15:00" ? "（15:00后T日顺延）" : "";
+      setNavStatus(`将使用T日${timeHint}的单位净值，若净值未公布则标记为待确认。`);
+    }
+  }, [form.fund_code, form.trade_date, form.initiated_time, form.transaction_type]);
+
   async function submit(event) {
     event.preventDefault();
     setSaving(true);
+    setSaveError("");
     try {
       const fundCode = normalizeFundCode(form.fund_code);
       if (form.transaction_type === "dca") {
@@ -961,6 +977,9 @@ function TransactionForm({ onCreated, adminToken }) {
       }
       setForm((current) => ({ ...current, amount: "", shares: "", nav: "", fee: "", dca_end_date: "", initiated_time: "", note: "" }));
       await onCreated();
+    } catch (err) {
+      const msg = typeof err === "string" ? err : err?.message || JSON.stringify(err) || "保存失败，请稍后重试";
+      setSaveError(msg);
     } finally {
       setSaving(false);
     }
@@ -969,6 +988,9 @@ function TransactionForm({ onCreated, adminToken }) {
   function update(key, value) {
     if (key === "amount" || key === "shares") {
       setLastEdited(key);
+    }
+    if (key === "transaction_type" && value === "sell") {
+      setLastEdited("shares");
     }
     setForm((current) => {
       const next = { ...current, [key]: value };
@@ -1108,6 +1130,7 @@ function TransactionForm({ onCreated, adminToken }) {
         备注
         <input value={form.note} onChange={(event) => update("note", event.target.value)} />
       </label>
+      {saveError && <div className="alert" style={{marginTop: "8px"}}>{saveError}</div>}
       <div className="calculation-note">
         {form.transaction_type === "dca" ? "定投计划不会立即计入持仓，实际扣款确认后再生成买入交易。" : navStatus || calculated.description}
       </div>

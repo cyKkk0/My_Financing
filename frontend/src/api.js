@@ -8,18 +8,41 @@ export class ApiError extends Error {
   }
 }
 
+function extractErrorMessage(payload) {
+  if (typeof payload === "string") return payload;
+  // FastAPI 422: detail is an array of {loc, msg, type}
+  if (Array.isArray(payload)) {
+    const parts = payload.map((e) => {
+      const loc = (e.loc || []).join(".");
+      return loc ? `${loc}: ${e.msg}` : e.msg;
+    });
+    return parts.join("; ") || "请求数据验证失败";
+  }
+  if (payload && typeof payload === "object") {
+    if (Array.isArray(payload.detail)) return extractErrorMessage(payload.detail);
+    if (typeof payload.detail === "string") return payload.detail;
+    if (typeof payload.message === "string") return payload.message;
+    try {
+      return JSON.stringify(payload);
+    } catch {
+      return "未知错误";
+    }
+  }
+  return String(payload || "请求失败");
+}
+
 async function responseError(response) {
   const text = await response.text();
-  let message = text;
   if (text) {
     try {
       const payload = JSON.parse(text);
-      message = payload.detail || payload.message || text;
+      const message = extractErrorMessage(payload.detail !== undefined ? payload.detail : payload);
+      return new ApiError(message || `Request failed: ${response.status}`, response.status);
     } catch {
-      message = text;
+      return new ApiError(text || `Request failed: ${response.status}`, response.status);
     }
   }
-  return new ApiError(message || `Request failed: ${response.status}`, response.status);
+  return new ApiError(`Request failed: ${response.status}`, response.status);
 }
 
 async function request(path, options = {}) {

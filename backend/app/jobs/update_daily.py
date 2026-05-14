@@ -26,6 +26,10 @@ def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
     skipped: list[str] = []
     updated_details: list[str] = []
 
+    # Supplement: daily snapshot API may carry today's NAV before the
+    # history-series endpoint is updated. Fetch once and index by fund code.
+    daily_snapshot = client.daily_nav_snapshot_index()
+
     for fund_code in fund_codes:
         nav_rows = _recent_navs_from_history(
             fund_code,
@@ -39,6 +43,13 @@ def update_daily_navs_and_snapshot(db: Session) -> dict[str, int | str]:
                 continue
             nav_rows = [latest]
         latest = nav_rows[0]
+
+        # If the daily snapshot has a fresher NAV than the history series, use it.
+        if fund_code.zfill(6) in daily_snapshot:
+            snap = daily_snapshot[fund_code.zfill(6)]
+            if snap["nav_date"] > latest["nav_date"]:
+                nav_rows.insert(0, snap)
+                latest = snap
 
         fund = db.get(models.Fund, fund_code)
         resolved_name = fund_names.get(fund_code.zfill(6))
@@ -341,6 +352,22 @@ def confirm_pending_transactions(
                     Decimal("0.0001"), rounding=ROUND_HALF_UP
                 )
             elif tx.transaction_type == "sell":
+                # Auto-calculate fee via FIFO if not manually set
+                if tx.fee == 0:
+                    try:
+                        from app.services.fee import fetch_and_calc_sell_fee
+
+                        auto_fee, breakdown = fetch_and_calc_sell_fee(
+                            db, tx.fund_code, tx.shares, tx.trade_date, nav_dec,
+                            exclude_tx_id=tx.id,
+                        )
+                        if auto_fee is not None:
+                            tx.fee = auto_fee
+                            if breakdown:
+                                prefix = f"自动计算手续费: {breakdown}"
+                                tx.note = f"{prefix}; {tx.note}" if tx.note else prefix
+                    except Exception:
+                        pass
                 tx.amount = (tx.shares * nav_dec - tx.fee).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
                 )

@@ -167,6 +167,23 @@ def create_transaction(
 
     effective_nav = resolved_nav if status == "confirmed" else None
 
+    auto_fee_breakdown: str | None = None
+    if payload.transaction_type == "sell" and payload.fee == 0 and effective_nav is not None:
+        try:
+            from app.services.fee import fetch_and_calc_sell_fee
+
+            shares_for_fee = payload.shares
+            if shares_for_fee == 0 and payload.amount > 0:
+                shares_for_fee = (payload.amount / effective_nav).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            if shares_for_fee > 0:
+                auto_fee, auto_fee_breakdown = fetch_and_calc_sell_fee(
+                    db, payload.fund_code, shares_for_fee, trade_date, effective_nav,
+                )
+                if auto_fee is not None:
+                    payload.fee = auto_fee
+        except Exception:
+            pass
+
     amount, shares = _resolve_transaction_numbers(
         payload.transaction_type,
         payload.amount,
@@ -183,6 +200,11 @@ def create_transaction(
     elif fund_name and fund.name == fund.code:
         fund.name = fund_name
 
+    note = payload.note
+    if auto_fee_breakdown:
+        prefix = f"自动计算手续费: {auto_fee_breakdown}"
+        note = f"{prefix}; {note}" if note else prefix
+
     tx = models.Transaction(
         fund_code=payload.fund_code,
         trade_date=trade_date,
@@ -191,7 +213,7 @@ def create_transaction(
         shares=shares,
         nav=effective_nav,
         fee=payload.fee,
-        note=payload.note,
+        note=note,
         initiated_at=initiated_at,
         confirmed_at=datetime.combine(confirm_date, datetime.min.time())
         if status == "confirmed" and confirm_date is not None
