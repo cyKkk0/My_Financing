@@ -46,12 +46,13 @@ async function responseError(response) {
 }
 
 async function request(path, options = {}) {
+  const { headers: optionHeaders = {}, ...fetchOptions } = options;
   const response = await fetch(`${API_BASE}${path}`, {
+    ...fetchOptions,
     headers: {
       "Content-Type": "application/json",
-      ...(options.headers || {}),
+      ...optionHeaders,
     },
-    ...options,
   });
 
   if (!response.ok) {
