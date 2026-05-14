@@ -949,7 +949,7 @@ function HoldingsTable({ holdings, onOpenFund }) {
                 </td>
                 <td className={Number(item.daily_pnl ?? 0) >= 0 ? "gain" : "loss"}>
                   <strong>{item.daily_pnl != null ? money(item.daily_pnl) : "-"}</strong>
-                  <small className={estimatedDailyPnl.className}>预估 {estimatedDailyPnl.text}</small>
+                  <small className={estimatedDailyPnl.className}>今日预估 {estimatedDailyPnl.text}</small>
                 </td>
                 <td className={Number(item.holding_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
                   <strong>{money(item.holding_profit ?? item.profit)}</strong>
