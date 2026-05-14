@@ -885,6 +885,35 @@ function DecisionRow({ label, value, tone = "" }) {
 }
 
 function HoldingsTable({ holdings, onOpenFund }) {
+  const [estimates, setEstimates] = useState({});
+  const estimateCodes = holdings.map((item) => item.fund_code).join("|");
+
+  useEffect(() => {
+    if (!holdings.length) {
+      setEstimates({});
+      return undefined;
+    }
+
+    let cancelled = false;
+    async function loadEstimates() {
+      const entries = await Promise.all(
+        holdings.map(async (item) => {
+          try {
+            return [item.fund_code, await getFundEstimate(item.fund_code)];
+          } catch (err) {
+            return [item.fund_code, { source: "error", message: err.message }];
+          }
+        })
+      );
+      if (!cancelled) setEstimates(Object.fromEntries(entries));
+    }
+
+    loadEstimates();
+    return () => {
+      cancelled = true;
+    };
+  }, [estimateCodes]);
+
   if (!holdings.length) return <EmptyState text="录入第一笔交易后，这里会显示持仓、成本和收益。" />;
   return (
     <div className="table-wrap holdings-window">
@@ -902,38 +931,61 @@ function HoldingsTable({ holdings, onOpenFund }) {
           </tr>
         </thead>
         <tbody>
-          {holdings.map((item) => (
-            <tr key={item.fund_code}>
-              <td className="fund-cell">
-                <button className="fund-link" type="button" onClick={() => onOpenFund?.(item)} title="查看收盘前决策看板">
-                  {item.fund_name}
-                </button>
-                <span>{item.fund_code}</span>
-              </td>
-              <td>{number(item.shares)}</td>
-              <td><strong>{item.latest_nav || "-"}</strong></td>
-              <td className="market-value-cell">
-                <strong>{money(item.market_value)}</strong>
-                <small>未确认 {money(item.unconfirmed_amount || 0)}</small>
-              </td>
-              <td className={Number(item.daily_pnl ?? 0) >= 0 ? "gain" : "loss"}>
-                <strong>{item.daily_pnl != null ? money(item.daily_pnl) : "-"}</strong>
-              </td>
-              <td className={Number(item.holding_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
-                <strong>{money(item.holding_profit ?? item.profit)}</strong>
-              </td>
-              <td className={Number(item.cumulative_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
-                <strong>{money(item.cumulative_profit ?? item.profit)}</strong>
-              </td>
-              <td className={Number(item.holding_profit_rate ?? item.profit_rate) >= 0 ? "gain" : "loss"}>
-                <strong>{percent(item.holding_profit_rate ?? item.profit_rate)}</strong>
-              </td>
-            </tr>
-          ))}
+          {holdings.map((item) => {
+            const estimatedDailyPnl = estimateDailyPnlForHolding(item, estimates[item.fund_code]);
+            return (
+              <tr key={item.fund_code}>
+                <td className="fund-cell">
+                  <button className="fund-link" type="button" onClick={() => onOpenFund?.(item)} title="查看收盘前决策看板">
+                    {item.fund_name}
+                  </button>
+                  <span>{item.fund_code}</span>
+                </td>
+                <td>{number(item.shares)}</td>
+                <td><strong>{item.latest_nav || "-"}</strong></td>
+                <td className="market-value-cell">
+                  <strong>{money(item.market_value)}</strong>
+                  <small>未确认 {money(item.unconfirmed_amount || 0)}</small>
+                </td>
+                <td className={Number(item.daily_pnl ?? 0) >= 0 ? "gain" : "loss"}>
+                  <strong>{item.daily_pnl != null ? money(item.daily_pnl) : "-"}</strong>
+                  <small className={estimatedDailyPnl.className}>预估 {estimatedDailyPnl.text}</small>
+                </td>
+                <td className={Number(item.holding_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
+                  <strong>{money(item.holding_profit ?? item.profit)}</strong>
+                </td>
+                <td className={Number(item.cumulative_profit ?? item.profit) >= 0 ? "gain" : "loss"}>
+                  <strong>{money(item.cumulative_profit ?? item.profit)}</strong>
+                </td>
+                <td className={Number(item.holding_profit_rate ?? item.profit_rate) >= 0 ? "gain" : "loss"}>
+                  <strong>{percent(item.holding_profit_rate ?? item.profit_rate)}</strong>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
   );
+}
+
+function estimateDailyPnlForHolding(item, estimate) {
+  if (!estimate) return { text: "加载中", className: "estimated-daily-pnl" };
+  if (estimate.source === "unavailable") return { text: "暂无", className: "estimated-daily-pnl muted" };
+  if (estimate.source === "error") return { text: "读取失败", className: "estimated-daily-pnl muted" };
+
+  const estimatedNav = Number(estimate.estimated_nav || 0);
+  const baseNav = Number(estimate.published_nav || item.latest_nav || 0);
+  const shares = Number(item.shares || 0);
+  if (estimatedNav <= 0 || baseNav <= 0 || shares <= 0) {
+    return { text: "暂无", className: "estimated-daily-pnl muted" };
+  }
+
+  const value = (estimatedNav - baseNav) * shares;
+  return {
+    text: money(value),
+    className: `estimated-daily-pnl ${value >= 0 ? "gain" : "loss"}`,
+  };
 }
 
 function TransactionForm({ onCreated, adminToken }) {

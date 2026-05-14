@@ -408,6 +408,18 @@ td span.loss {
   color: #059669;
 }
 
+.estimated-daily-pnl {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.estimated-daily-pnl.muted {
+  color: #94a3b8;
+}
+
 .dual-cell strong,
 td > strong {
   display: block;
