@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import * as echarts from "echarts";
-import { Activity, BarChart3, Brain, CircleDollarSign, LogIn, LogOut, Plus, RefreshCw, TrendingUp } from "lucide-react";
+import { Activity, ArrowLeft, BarChart3, Brain, CircleDollarSign, Clock3, LogIn, LogOut, Plus, RefreshCw, TrendingUp } from "lucide-react";
 
 import {
   createDcaPlan,
@@ -11,6 +11,7 @@ import {
   updateDcaPlan,
   deleteTransaction,
   deleteTransactionsBatch,
+  getFundEstimate,
   getFundNav,
   getFundPerformance,
   getLatestAdvice,
@@ -59,6 +60,7 @@ function App() {
   const [dcaPlans, setDcaPlans] = useState([]);
   const [dcaExecutions, setDcaExecutions] = useState([]);
   const [page, setPage] = useState("dashboard");
+  const [selectedFund, setSelectedFund] = useState(null);
   const [advice, setAdvice] = useState(null);
   const [loading, setLoading] = useState(true);
   const [updatingNav, setUpdatingNav] = useState(false);
@@ -183,6 +185,19 @@ function App() {
     );
   }
 
+  if (page === "fund-detail" && selectedFund) {
+    return (
+      <FundDetailPage
+        holding={selectedFund}
+        onBack={async () => {
+          setPage("dashboard");
+          setSelectedFund(null);
+          await loadData();
+        }}
+      />
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -215,10 +230,6 @@ function App() {
         <Metric icon={<BarChart3 />} label="持仓成本" value={money(summary.total_invested)} />
       </section>
 
-      <section style={{marginBottom: "16px"}}>
-        <FundPerformancePanel holdings={summary.holdings} />
-      </section>
-
       <section className="dashboard-grid">
         <Panel title="资产走势">
           <PortfolioChart snapshots={snapshots} period={snapshotPeriod} onPeriodChange={setSnapshotPeriod} />
@@ -230,7 +241,13 @@ function App() {
 
       <section className="content-grid equal-height">
         <Panel title="持仓明细">
-          <HoldingsTable holdings={summary.holdings} />
+          <HoldingsTable
+            holdings={summary.holdings}
+            onOpenFund={(holding) => {
+              setSelectedFund(holding);
+              setPage("fund-detail");
+            }}
+          />
         </Panel>
         <Panel title="新增交易">
           {isAdmin ? <TransactionForm onCreated={loadData} adminToken={adminToken} /> : <GuestNotice size="tall" text="访客模式下只能查看数据。进入管理模式后可新增交易。" />}
@@ -601,213 +618,6 @@ function HoldingChart({ holdings }) {
   return <div className="chart" ref={ref} />;
 }
 
-function FundPerformancePanel({ holdings }) {
-  const [fundCode, setFundCode] = useState("");
-  const [range, setRange] = useState("month");
-  const [chartData, setChartData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const ranges = [
-    { key: "week", label: "近一周" },
-    { key: "month", label: "近一月" },
-    { key: "3month", label: "近三月" },
-    { key: "6month", label: "近半年" },
-    { key: "year", label: "近一年" },
-  ];
-
-  useEffect(() => {
-    if (!fundCode) {
-      setChartData(null);
-      return;
-    }
-    let cancelled = false;
-    async function load() {
-      setLoading(true);
-      setError("");
-      try {
-        const data = await getFundPerformance(fundCode, range);
-        if (!cancelled) setChartData(data);
-      } catch (err) {
-        if (!cancelled) setError(err.message);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    load();
-    return () => { cancelled = true; };
-  }, [fundCode, range]);
-
-  const chartRef = useChart((chart) => {
-    if (!chartData || !chartData.length) {
-      chart.setOption({
-        title: { text: fundCode ? "暂无数据" : "请选择基金", left: "center", top: "center", textStyle: { color: "#94a3b8", fontSize: 14 } },
-      });
-      return;
-    }
-    const dates = chartData.map((d) => d.nav_date);
-    const navs = chartData.map((d) => Number(d.unit_nav));
-    const cumulativeReturns = chartData.map((d) => d.cumulative_return != null ? Number(d.cumulative_return) * 100 : 0);
-    const growthRates = chartData.map((d) => d.daily_growth_rate != null ? Number(d.daily_growth_rate) * 100 : null);
-    // Fund index: normalized to 100 at the first NAV in range
-    const baseNav = navs[0];
-    const fundIndex = navs.map((n) => baseNav !== 0 ? (n / baseNav) * 100 : 100);
-    const minIdx = Math.min(...fundIndex);
-    const maxIdx = Math.max(...fundIndex);
-    const idxPadding = Math.max((maxIdx - minIdx) * 0.15, 2);
-
-    chart.setOption({
-      grid: { left: 16, right: 56, top: 24, bottom: 40 },
-      tooltip: {
-        trigger: "axis",
-        backgroundColor: "#ffffff",
-        borderColor: "#e8ecf2",
-        borderWidth: 1,
-        textStyle: { color: "#1a1a2e", fontSize: 13 },
-        formatter: function (params) {
-          const date = params[0].axisValue;
-          let tip = `<div style="font-size:12px;color:#94a3b8;margin-bottom:4px">${date}</div>`;
-          params.forEach(function (p) {
-            if (p.value == null) return;
-            if (p.seriesName === "基金指数") {
-              tip += `<div style="font-size:13px">${p.marker} ${p.seriesName} <b style="margin-left:8px">${Number(p.value).toFixed(2)}</b></div>`;
-            }
-            if (p.seriesName === "累计收益") {
-              const v = Number(p.value);
-              const color = v >= 0 ? "#dc2626" : "#059669";
-              const sign = v >= 0 ? "+" : "";
-              tip += `<div style="font-size:13px;color:${color}">${p.marker} ${p.seriesName} <b style="margin-left:8px">${sign}${v.toFixed(2)}%</b></div>`;
-            }
-          });
-          if (params[0].dataIndex > 0 && growthRates[params[0].dataIndex] != null) {
-            const g = growthRates[params[0].dataIndex];
-            const d = fundIndex[params[0].dataIndex] - fundIndex[params[0].dataIndex - 1];
-            const color = g >= 0 ? "#dc2626" : "#059669";
-            const sign = g >= 0 ? "+" : "";
-            tip += `<div style="font-size:11px;color:${color};margin-top:2px">日涨跌 ${sign}${d.toFixed(2)} (${sign}${g.toFixed(2)}%)</div>`;
-          }
-          return tip;
-        },
-      },
-      xAxis: {
-        type: "category",
-        data: dates,
-        boundaryGap: false,
-        axisLine: { lineStyle: { color: "#e8ecf2" } },
-        axisTick: { show: false },
-        axisLabel: {
-          color: "#94a3b8",
-          fontSize: 11,
-          rotate: dates.length > 60 ? 45 : 0,
-          formatter: function (v) {
-            if (dates.length > 60) return v.slice(5);
-            if (dates.length > 30) return v.slice(5).replace("-", "/");
-            return v;
-          },
-        },
-      },
-      yAxis: [
-        {
-          type: "value",
-          min: minIdx - idxPadding,
-          max: maxIdx + idxPadding,
-          splitNumber: 4,
-          axisLabel: { color: "#2563eb", fontSize: 11, formatter: function (v) { return v.toFixed(1); } },
-          splitLine: { lineStyle: { color: "#f1f5f9", type: "dashed" } },
-        },
-        {
-          type: "value",
-          splitNumber: 4,
-          axisLabel: { color: "#f97316", fontSize: 11, formatter: "{value}%" },
-          splitLine: { show: false },
-        },
-      ],
-      series: [
-        {
-          name: "基金指数",
-          type: "line",
-          yAxisIndex: 0,
-          data: fundIndex,
-          smooth: false,
-          symbol: "none",
-          lineStyle: { color: "#2563eb", width: 2 },
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: "rgba(37,99,235,0.15)" },
-              { offset: 1, color: "rgba(37,99,235,0.01)" },
-            ]),
-          },
-        },
-        {
-          name: "累计收益",
-          type: "line",
-          yAxisIndex: 1,
-          data: cumulativeReturns,
-          smooth: false,
-          symbol: "none",
-          lineStyle: { color: "#f97316", width: 2 },
-        },
-      ],
-    });
-  }, [chartData]);
-
-  const fundOptions = holdings.map((h) => ({
-    code: h.fund_code,
-    name: h.fund_name,
-  }));
-
-  return (
-    <Panel
-      title={
-        <span className="panel-title-row">
-          业绩走势
-          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <select
-              value={fundCode}
-              onChange={(e) => setFundCode(e.target.value)}
-              style={{ minHeight: 32, width: 180, fontSize: 13, padding: "0 6px" }}
-            >
-              <option value="">选择基金</option>
-              {fundOptions.map((f) => (
-                <option key={f.code} value={f.code}>{f.name}</option>
-              ))}
-            </select>
-            <div className="range-toggle">
-              {ranges.map((r) => (
-                <button
-                  key={r.key}
-                  className={range === r.key ? "active" : ""}
-                  type="button"
-                  onClick={() => setRange(r.key)}
-                >
-                  {r.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </span>
-      }
-    >
-      {error && <p className="chat-error">{error}</p>}
-      {loading && <EmptyState text="正在加载..." />}
-      {fundCode ? (
-        <>
-          <div className="chart chart-tall" ref={chartRef} />
-          {chartData && chartData.length > 1 && (
-            <div className="perf-stats">
-              {_renderStat("区间收益", formatPerfReturn(chartData))}
-              {_renderStat("最新净值", Number(chartData[chartData.length - 1].unit_nav).toFixed(4))}
-              {_renderStat("最高净值", Math.max(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
-              {_renderStat("最低净值", Math.min(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
-            </div>
-          )}
-        </>
-      ) : (
-        <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 13, padding: "10px 0 30px" }}>请选择基金查看业绩走势</div>
-      )}
-    </Panel>
-  );
-}
-
 function _renderStat(label, value) {
   const isReturn = label === "区间收益";
   const num = Number(value);
@@ -827,7 +637,254 @@ function formatPerfReturn(data) {
   return "0.00";
 }
 
-function HoldingsTable({ holdings }) {
+function FundDetailPage({ holding, onBack }) {
+  const [range, setRange] = useState("month");
+  const [chartData, setChartData] = useState([]);
+  const [estimate, setEstimate] = useState(null);
+  const [chartLoading, setChartLoading] = useState(false);
+  const [estimateLoading, setEstimateLoading] = useState(false);
+  const [chartError, setChartError] = useState("");
+  const [estimateError, setEstimateError] = useState("");
+  const [now, setNow] = useState(() => new Date());
+  const fundCode = holding.fund_code;
+  const ranges = [
+    { key: "week", label: "近一周" },
+    { key: "month", label: "近一月" },
+    { key: "3month", label: "近三月" },
+    { key: "6month", label: "近半年" },
+    { key: "year", label: "近一年" },
+  ];
+
+  const loadEstimate = React.useCallback(async () => {
+    setEstimateLoading(true);
+    setEstimateError("");
+    try {
+      const data = await getFundEstimate(fundCode);
+      setEstimate(data);
+    } catch (err) {
+      setEstimate(null);
+      setEstimateError(err.message);
+    } finally {
+      setEstimateLoading(false);
+    }
+  }, [fundCode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadChart() {
+      setChartLoading(true);
+      setChartError("");
+      try {
+        const data = await getFundPerformance(fundCode, range);
+        if (!cancelled) setChartData(data || []);
+      } catch (err) {
+        if (!cancelled) setChartError(err.message);
+      } finally {
+        if (!cancelled) setChartLoading(false);
+      }
+    }
+    loadChart();
+    return () => { cancelled = true; };
+  }, [fundCode, range]);
+
+  useEffect(() => {
+    loadEstimate();
+  }, [loadEstimate]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const estimatedNav = Number(estimate?.estimated_nav || 0);
+  const latestChartPoint = chartData.length ? chartData[chartData.length - 1] : null;
+  const latestOfficialNav = Number(latestChartPoint?.unit_nav || estimate?.published_nav || holding.latest_nav || 0);
+  const latestOfficialNavDate = latestChartPoint?.nav_date || holding.nav_date || "-";
+  const shares = Number(holding.shares || 0);
+  const estimatedMarketValue = estimatedNav > 0 ? estimatedNav * shares : null;
+  const estimatedDailyPnl = estimatedNav > 0 && latestOfficialNav > 0 ? (estimatedNav - latestOfficialNav) * shares : null;
+  const estimateTone = Number(estimate?.estimated_growth_rate || 0) >= 0 ? "gain" : "loss";
+  const estimateUnavailable = estimate?.source === "unavailable";
+  const estimateHint = estimateUnavailable
+    ? estimate.message || "该基金暂无盘中估值"
+    : estimate?.estimate_date
+      ? `估值日 ${estimate.estimate_date}`
+      : "来自盘中估值源";
+
+  const chartRef = useChart((chart) => {
+    const points = (chartData || []).map((item) => ({
+      date: item.nav_date,
+      nav: Number(item.unit_nav),
+      official: true,
+    }));
+    const estimateDate = estimate?.estimate_date || new Date().toISOString().slice(0, 10);
+    if (estimatedNav > 0) {
+      const existing = points.find((item) => item.date === estimateDate);
+      if (existing) {
+        existing.estimate = estimatedNav;
+      } else {
+        points.push({ date: estimateDate, nav: null, estimate: estimatedNav, official: false });
+      }
+    }
+    points.sort((a, b) => a.date.localeCompare(b.date));
+
+    if (!points.length) {
+      chart.setOption({
+        title: { text: "暂无净值数据", left: "center", top: "center", textStyle: { color: "#94a3b8", fontSize: 14 } },
+      });
+      return;
+    }
+
+    const dates = points.map((item) => item.date);
+    const officialNavs = points.map((item) => item.official ? item.nav : null);
+    const estimateNavs = points.map((item) => item.estimate ?? null);
+    const values = points.flatMap((item) => [item.nav, item.estimate]).filter((value) => value != null && Number.isFinite(value));
+    const minNav = Math.min(...values);
+    const maxNav = Math.max(...values);
+    const padding = Math.max((maxNav - minNav) * 0.18, 0.01);
+
+    chart.setOption({
+      grid: { left: 48, right: 24, top: 32, bottom: 42 },
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "#ffffff",
+        borderColor: "#e8ecf2",
+        borderWidth: 1,
+        textStyle: { color: "#1a1a2e", fontSize: 13 },
+        formatter: function (params) {
+          const date = params[0].axisValue;
+          let tip = `<div style="font-size:12px;color:#94a3b8;margin-bottom:4px">${date}</div>`;
+          params.forEach((p) => {
+            if (p.value == null || p.value === "-") return;
+            tip += `<div>${p.marker} ${p.seriesName} <b style="margin-left:8px">${Number(p.value).toFixed(4)}</b></div>`;
+          });
+          return tip;
+        },
+      },
+      xAxis: {
+        type: "category",
+        data: dates,
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: "#e8ecf2" } },
+        axisTick: { show: false },
+        axisLabel: { color: "#94a3b8", fontSize: 11, formatter: (v) => v.slice(5).replace("-", "/") },
+      },
+      yAxis: {
+        type: "value",
+        min: minNav - padding,
+        max: maxNav + padding,
+        axisLabel: { color: "#64748b", fontSize: 11, formatter: (v) => Number(v).toFixed(3) },
+        splitLine: { lineStyle: { color: "#f1f5f9", type: "dashed" } },
+      },
+      series: [
+        {
+          name: "单位净值",
+          type: "line",
+          data: officialNavs,
+          symbol: "none",
+          connectNulls: false,
+          lineStyle: { color: "#2563eb", width: 2 },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: "rgba(37,99,235,0.12)" },
+              { offset: 1, color: "rgba(37,99,235,0.01)" },
+            ]),
+          },
+        },
+        {
+          name: "盘中估值",
+          type: "scatter",
+          data: estimateNavs,
+          symbolSize: 12,
+          itemStyle: { color: "#f97316" },
+        },
+      ],
+    });
+  }, [chartData, estimate, estimatedNav]);
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <div>
+          <button className="ghost-button compact back-button" type="button" onClick={onBack}>
+            <ArrowLeft size={16} />
+            返回
+          </button>
+          <p className="eyebrow">Pre-close Watch</p>
+          <h1>{holding.fund_name}</h1>
+          <p className="fund-detail-subtitle">{fundCode} · 持有 {number(holding.shares)} 份</p>
+        </div>
+        <div className="topbar-actions">
+          <button className="icon-button text-button" type="button" onClick={loadEstimate} disabled={estimateLoading} title="刷新盘中估值">
+            <RefreshCw size={18} />
+            {estimateLoading ? "刷新中" : "刷新估值"}
+          </button>
+        </div>
+      </header>
+
+      <section className="preclose-grid">
+        <Metric icon={<Activity />} label="当前估值" value={estimate?.estimated_nav ? Number(estimate.estimated_nav).toFixed(4) : "-"} hint={estimateHint} />
+        <Metric icon={<TrendingUp />} label="估算涨跌幅" value={estimate?.estimated_growth_rate != null ? percentPoint(estimate.estimated_growth_rate) : "-"} tone={estimateTone} />
+        <Metric icon={<CircleDollarSign />} label="估算市值" value={estimatedMarketValue != null ? money(estimatedMarketValue) : "-"} />
+        <Metric icon={<Clock3 />} label="15:00 前提交" value={countdownToMarketClose(now)} hint="普通场外基金通常以 15:00 为交易日切换点" />
+      </section>
+
+      {estimateError && <div className="alert">估值读取失败：{estimateError}</div>}
+
+      <section className="fund-detail-grid">
+        <Panel
+          title={
+            <span className="panel-title-row">
+              净值波动
+              <div className="range-toggle">
+                {ranges.map((r) => (
+                  <button key={r.key} className={range === r.key ? "active" : ""} type="button" onClick={() => setRange(r.key)}>
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            </span>
+          }
+        >
+          {chartError && <p className="chat-error">{chartError}</p>}
+          {chartLoading && <EmptyState text="正在加载净值走势..." />}
+          <div className="chart chart-tall" ref={chartRef} />
+          {chartData.length > 1 && (
+            <div className="perf-stats">
+              {_renderStat("区间收益", formatPerfReturn(chartData))}
+              {_renderStat("最新净值", Number(chartData[chartData.length - 1].unit_nav).toFixed(4))}
+              {_renderStat("最高净值", Math.max(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
+              {_renderStat("最低净值", Math.min(...chartData.map(d => Number(d.unit_nav))).toFixed(4))}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="赎回参考">
+          <div className="decision-list">
+            <DecisionRow label="上一净值" value={latestOfficialNav ? latestOfficialNav.toFixed(4) : "-"} />
+            <DecisionRow label="净值日期" value={latestOfficialNavDate} />
+            <DecisionRow label="持有收益" value={money(holding.holding_profit ?? holding.profit)} tone={Number(holding.holding_profit ?? holding.profit) >= 0 ? "gain" : "loss"} />
+            <DecisionRow label="持有收益率" value={percent(holding.holding_profit_rate ?? holding.profit_rate)} tone={Number(holding.holding_profit_rate ?? holding.profit_rate) >= 0 ? "gain" : "loss"} />
+            <DecisionRow label="估算当日盈亏" value={estimatedDailyPnl != null ? money(estimatedDailyPnl) : estimateUnavailable ? "暂无估值" : "-"} tone={Number(estimatedDailyPnl || 0) >= 0 ? "gain" : "loss"} />
+            <DecisionRow label="估算偏差" value={estimate?.estimate_deviation != null ? Number(estimate.estimate_deviation).toFixed(4) : "-"} />
+          </div>
+          <p className="decision-note">盘中估值仅用于临近收盘前判断，最终成交净值以基金公司晚间公布为准。</p>
+        </Panel>
+      </section>
+    </main>
+  );
+}
+
+function DecisionRow({ label, value, tone = "" }) {
+  return (
+    <div className="decision-row">
+      <span>{label}</span>
+      <strong className={tone}>{value}</strong>
+    </div>
+  );
+}
+
+function HoldingsTable({ holdings, onOpenFund }) {
   if (!holdings.length) return <EmptyState text="录入第一笔交易后，这里会显示持仓、成本和收益。" />;
   return (
     <div className="table-wrap holdings-window">
@@ -848,7 +905,9 @@ function HoldingsTable({ holdings }) {
           {holdings.map((item) => (
             <tr key={item.fund_code}>
               <td className="fund-cell">
-                <strong>{item.fund_name}</strong>
+                <button className="fund-link" type="button" onClick={() => onOpenFund?.(item)} title="查看收盘前决策看板">
+                  {item.fund_name}
+                </button>
                 <span>{item.fund_code}</span>
               </td>
               <td>{number(item.shares)}</td>
@@ -1760,8 +1819,24 @@ function percent(value) {
   return `${(Number(value || 0) * 100).toFixed(2)}%`;
 }
 
+function percentPoint(value) {
+  const num = Number(value || 0);
+  return `${num >= 0 ? "+" : ""}${num.toFixed(2)}%`;
+}
+
 function number(value) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 4 }).format(Number(value || 0));
+}
+
+function countdownToMarketClose(now) {
+  const close = new Date(now);
+  close.setHours(15, 0, 0, 0);
+  const diffMs = close.getTime() - now.getTime();
+  if (diffMs <= 0) return "已过 15:00";
+  const totalSeconds = Math.floor(diffMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}分${String(seconds).padStart(2, "0")}秒`;
 }
 
 function typeName(type) {

@@ -141,6 +141,10 @@ export function getFundPerformance(fundCode, range = "month") {
   return request(`/funds/${fundCode}/performance?range=${range}`);
 }
 
+export function getFundEstimate(fundCode) {
+  return request(`/funds/${fundCode}/estimate`);
+}
+
 export function createTransaction(payload, adminToken) {
   return request("/transactions", {
     method: "POST",

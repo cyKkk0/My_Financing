@@ -2,6 +2,11 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
+import json
+import re
+import shutil
+import subprocess
+import time
 
 import pandas as pd
 
@@ -74,6 +79,168 @@ class AkshareFundClient:
 
     def daily_open_fund_navs(self) -> pd.DataFrame:
         return self.ak.fund_open_fund_daily_em()
+
+    def fund_value_estimate_for(self, fund_code: str) -> dict[str, Any] | None:
+        """Return the current intraday valuation estimate for an open fund.
+
+        The detail page queries one fund at a time, so prefer Eastmoney's
+        per-fund endpoint. AKShare's batch endpoint can be slow or fail TLS
+        handshakes in some local environments, and an empty single-fund result
+        usually means the fund does not publish intraday valuation data.
+        """
+        try:
+            return self._fund_value_estimate_from_eastmoney_js(fund_code)
+        except Exception:
+            return None
+
+    def _fund_value_estimate_from_akshare_table(self, fund_code: str) -> dict[str, Any] | None:
+        df = self.ak.fund_value_estimation_em(symbol="全部")
+        if df.empty:
+            return None
+
+        code_column = _first_present_column(df, ["基金代码", "代码"])
+        if code_column is None:
+            return None
+
+        code = fund_code.zfill(6)
+        matched = df[df[code_column].astype(str).str.strip().str.zfill(6) == code]
+        if matched.empty:
+            return None
+
+        record = matched.iloc[0].to_dict()
+        date_value = _pick_value(record, ["交易日", "估算日期", "日期"])
+        estimate_date = None
+        if date_value not in (None, "") and not pd.isna(date_value):
+            estimate_date = pd.to_datetime(date_value).date()
+
+        return {
+            "fund_code": code,
+            "fund_name": _pick_value(record, ["基金名称", "基金简称", "名称"]),
+            "estimate_date": estimate_date,
+            "estimated_nav": _decimal_or_none(
+                _pick_value(record, ["交易日-估算数据-估算值", "估算值", "估算净值", "当前估值"])
+            ),
+            "estimated_growth_rate": _decimal_or_none(
+                _pick_value(record, ["交易日-估算数据-估算增长率", "估算增长率", "估算涨幅", "涨跌幅"])
+            ),
+            "published_nav": _decimal_or_none(
+                _pick_value(record, ["交易日-公布数据-单位净值", "单位净值", "最新净值"])
+            ),
+            "published_growth_rate": _decimal_or_none(
+                _pick_value(record, ["交易日-公布数据-日增长率", "日增长率", "日涨幅"])
+            ),
+            "estimate_deviation": _decimal_or_none(_pick_value(record, ["估算偏差"])),
+            "estimate_deviation_rate": _decimal_or_none(_pick_value(record, ["估算偏差率"])),
+            "source": "akshare_value_estimation",
+        }
+
+    def _fund_value_estimate_from_eastmoney_js(self, fund_code: str) -> dict[str, Any] | None:
+        """Fallback to Eastmoney's single-fund valuation endpoint.
+
+        AKShare's batch endpoint currently uses api.fund.eastmoney.com, which
+        can fail with TLS EOF errors in some local OpenSSL/proxy environments.
+        This per-fund endpoint is less data-rich, but it gives the page the
+        fields needed for pre-close decisions.
+        """
+        code = fund_code.zfill(6)
+        text = self._fetch_eastmoney_fundgz_text(code)
+        if not text:
+            return None
+
+        match = re.search(r"jsonpgz\((.*)\);?$", text.strip())
+        if not match:
+            return None
+
+        payload_text = match.group(1).strip()
+        if not payload_text:
+            return None
+
+        try:
+            payload = json.loads(payload_text)
+        except ValueError:
+            return None
+        if not payload or str(payload.get("fundcode", "")).zfill(6) != code:
+            return None
+
+        published_nav = _decimal_or_none(payload.get("dwjz"))
+        estimated_nav = _decimal_or_none(payload.get("gsz"))
+        estimate_deviation = None
+        estimate_deviation_rate = None
+        if published_nav is not None and estimated_nav is not None:
+            estimate_deviation = estimated_nav - published_nav
+            if published_nav != 0:
+                estimate_deviation_rate = (estimate_deviation / published_nav) * Decimal("100")
+
+        estimate_date = None
+        gztime = payload.get("gztime")
+        if gztime:
+            estimate_date = pd.to_datetime(gztime).date()
+        elif payload.get("jzrq"):
+            estimate_date = pd.to_datetime(payload["jzrq"]).date()
+
+        return {
+            "fund_code": code,
+            "fund_name": payload.get("name"),
+            "estimate_date": estimate_date,
+            "estimated_nav": estimated_nav,
+            "estimated_growth_rate": _decimal_or_none(payload.get("gszzl")),
+            "published_nav": published_nav,
+            "published_growth_rate": None,
+            "estimate_deviation": estimate_deviation,
+            "estimate_deviation_rate": estimate_deviation_rate,
+            "source": "eastmoney_fundgz",
+        }
+
+    def _fetch_eastmoney_fundgz_text(self, fund_code: str) -> str | None:
+        code = fund_code.zfill(6)
+        url = f"http://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time() * 1000)}"
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+        referer = f"http://fund.eastmoney.com/{code}.html"
+
+        curl = shutil.which("curl")
+        if curl:
+            completed = subprocess.run(
+                [
+                    curl,
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--max-time",
+                    "8",
+                    "--user-agent",
+                    user_agent,
+                    "--referer",
+                    referer,
+                    url,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                return completed.stdout
+
+        try:
+            import requests
+
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": user_agent,
+                    "Referer": referer,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity",
+                    "Connection": "close",
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            return None
 
     def fund_name_for(self, fund_code: str) -> str | None:
         df = self.list_open_funds()

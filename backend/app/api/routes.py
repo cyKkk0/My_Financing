@@ -20,6 +20,7 @@ from app.schemas import (
     DcaPlanCreate,
     DcaPlanOut,
     DcaPlanUpdate,
+    FundEstimateOut,
     FundPerformancePoint,
     LoginRequest,
     LoginResponse,
@@ -728,6 +729,25 @@ def get_fund_nav(fund_code: str, trade_date: date, db: Session = Depends(get_db)
         "unit_nav": str(nav["unit_nav"]),
         "source": nav["source"],
     }
+
+
+@router.get("/funds/{fund_code}/estimate", response_model=FundEstimateOut)
+def fund_estimate(fund_code: str) -> dict[str, object]:
+    try:
+        estimate = AkshareFundClient().fund_value_estimate_for(fund_code)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AKShare 估值数据暂时不可用：{exc}") from exc
+
+    if estimate is None:
+        return {
+            "fund_code": fund_code.zfill(6),
+            "message": "该基金暂无可用盘中估值",
+            "source": "unavailable",
+            "fetched_at": datetime.utcnow(),
+        }
+
+    estimate["fetched_at"] = datetime.utcnow()
+    return estimate
 
 
 @router.get("/funds/{fund_code}/performance", response_model=list[FundPerformancePoint])

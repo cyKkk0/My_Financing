@@ -168,6 +168,21 @@ class FundPerformancePoint(BaseModel):
     cumulative_return: Decimal | None = None
 
 
+class FundEstimateOut(BaseModel):
+    fund_code: str
+    fund_name: str | None = None
+    message: str | None = None
+    estimate_date: date | None = None
+    estimated_nav: Decimal | None = None
+    estimated_growth_rate: Decimal | None = None
+    published_nav: Decimal | None = None
+    published_growth_rate: Decimal | None = None
+    estimate_deviation: Decimal | None = None
+    estimate_deviation_rate: Decimal | None = None
+    source: str
+    fetched_at: datetime
+
+
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=20)
 
